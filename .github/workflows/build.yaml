@@ -1,0 +1,124 @@
+name: Build
+
+# PR: patches apply + build. Main: also publish release v<version>-p<n>
+# (skipped when it exists). Release recipe mirrors upstream's
+# release-stable-manual.yml for x86_64-unknown-linux-gnu.
+on:
+  push:
+    branches: [main]
+    paths: [release.env, patches/**, .github/workflows/build.yaml]
+  pull_request:
+    paths: [release.env, patches/**, .github/workflows/build.yaml]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  TARGET: x86_64-unknown-linux-gnu
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  build:
+    # Same runner as upstream: links against glibc 2.35.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: .zcp
+
+      - name: Read release.env
+        id: rel
+        run: |
+          . .zcp/release.env
+          tag="v${ZEROCLAW_VERSION}-p${PATCH_RELEASE}"
+          exists=false
+          gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 && exists=true
+          publish=false
+          [ "$GITHUB_EVENT_NAME" != pull_request ] && [ "$exists" = false ] && publish=true
+          {
+            echo "upstream=v$ZEROCLAW_VERSION"
+            echo "tag=$tag"
+            echo "publish=$publish"
+          } >> "$GITHUB_OUTPUT"
+          echo "tag $tag, exists $exists, publish $publish"
+          if [ "$GITHUB_EVENT_NAME" = pull_request ] && [ "$exists" = true ]; then
+            echo "::error::$tag already released: bump PATCH_RELEASE in release.env"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          repository: zeroclaw-labs/zeroclaw
+          ref: ${{ steps.rel.outputs.upstream }}
+          path: zeroclaw
+
+      - name: Apply patches
+        working-directory: zeroclaw
+        run: |
+          grep -vE '^\s*(#|$)' ../.zcp/patches/series | while read -r p; do
+            echo "applying $p"
+            git apply --verbose "../.zcp/patches/$p"
+          done
+          git diff --stat
+
+      - name: Rust toolchain
+        working-directory: zeroclaw
+        run: |
+          tc=$(grep -m1 -oP 'toolchain:\s*\K[0-9][0-9.]*' .github/workflows/release-stable-manual.yml)
+          rustup toolchain install "$tc" --profile minimal --target "$TARGET"
+          rustup override set "$tc"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: zeroclaw
+          key: ${{ steps.rel.outputs.upstream }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: zeroclaw/.nvmrc
+
+      - name: Build web dashboard
+        working-directory: zeroclaw
+        run: cargo web build
+
+      - name: Build binaries
+        working-directory: zeroclaw
+        run: |
+          features="$(cargo run --quiet -p xtask --bin generate -- features --selection dist --target "$TARGET")"
+          echo "features: $features"
+          cargo build --release --locked --no-default-features --features "$features" --target "$TARGET"
+          cargo build --release --locked -p zerocode --target "$TARGET"
+          cargo build --release --locked -p zerorelay --target "$TARGET"
+          "target/$TARGET/release/zeroclaw" --version
+
+      - name: Package
+        working-directory: zeroclaw
+        run: |
+          bash scripts/ci/package_release_archive.sh "$TARGET" zeroclaw tar.gz Linux
+          sha256sum "zeroclaw-$TARGET.tar.gz" | tee "zeroclaw-$TARGET.tar.gz.sha256"
+
+      - name: Publish release
+        if: steps.rel.outputs.publish == 'true'
+        working-directory: zeroclaw
+        env:
+          TAG: ${{ steps.rel.outputs.tag }}
+          UPSTREAM: ${{ steps.rel.outputs.upstream }}
+        run: |
+          {
+            echo "zeroclaw-labs/zeroclaw $UPSTREAM + patches:"
+            echo
+            grep -vE '^\s*(#|$)' ../.zcp/patches/series | while read -r p; do
+              echo "- $p: $(sed -n 's/^Subject: \(\[PATCH[^]]*\] \)\{0,1\}//p' "../.zcp/patches/$p" | head -1)"
+            done
+            echo
+            echo "sha256 \`$(cut -d' ' -f1 "zeroclaw-$TARGET.tar.gz.sha256")\`"
+          } > notes.md
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "$TAG" --notes-file notes.md \
+            "zeroclaw-$TARGET.tar.gz" "zeroclaw-$TARGET.tar.gz.sha256"

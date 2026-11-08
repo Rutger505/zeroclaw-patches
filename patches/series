@@ -1,0 +1,2 @@
+# Applied in order with git apply onto the upstream tag in release.env.
+0001-gateway-ws-model-provider.patch

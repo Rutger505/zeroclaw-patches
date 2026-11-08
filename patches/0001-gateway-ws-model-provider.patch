@@ -1,0 +1,122 @@
+From b28528393d36e601740499998d5b969588ebe516 Mon Sep 17 00:00:00 2001
+From: Rutger Pronk <rutger.pronk11@gmail.com>
+Date: Sun, 8 Nov 2026 18:54:46 +0000
+Subject: [PATCH] feat(gateway): per-session model_provider on /ws/chat
+
+/ws/chat?model_provider=<family>.<alias> switches that connection's agent
+to a configured provider profile and its model, without touching config.
+Other sessions keep the agent's own model_provider. Unknown or modelless
+profiles are rejected with an error frame (INVALID_MODEL_PROVIDER) and
+close code 1008.
+---
+ crates/zeroclaw-gateway/src/ws.rs          | 24 +++++++++++++++++
+ crates/zeroclaw-runtime/src/agent/agent.rs | 30 ++++++++++++++++++++++
+ 2 files changed, 54 insertions(+)
+
+diff --git a/crates/zeroclaw-gateway/src/ws.rs b/crates/zeroclaw-gateway/src/ws.rs
+index 66c51f7c5..029f0400c 100644
+--- a/crates/zeroclaw-gateway/src/ws.rs
++++ b/crates/zeroclaw-gateway/src/ws.rs
+@@ -98,6 +98,10 @@ pub struct WsQuery {
+     pub cwd: Option<String>,
+     #[serde(default, alias = "workspaceDir", alias = "workspace_dir")]
+     pub workspace_dir: Option<String>,
++    /// Model provider profile (`<family>.<alias>`) for this session only,
++    /// overriding the agent's `model_provider` without touching config.
++    #[serde(default, alias = "modelProvider")]
++    pub model_provider: Option<String>,
+ }
+ 
+ fn extract_ws_token<'a>(headers: &'a HeaderMap, query_token: Option<&'a str>) -> Option<&'a str> {
+@@ -200,6 +204,7 @@ pub async fn handle_ws_chat(
+     let session_id = params.session_id;
+     let session_name = params.name;
+     let session_cwd = params.cwd.or(params.workspace_dir);
++    let session_model_provider = params.model_provider.filter(|s| !s.trim().is_empty());
+     ws.on_upgrade(move |socket| {
+         handle_socket(
+             socket,
+@@ -208,6 +213,7 @@ pub async fn handle_ws_chat(
+             session_id,
+             session_name,
+             session_cwd,
++            session_model_provider,
+             auth_subject,
+         )
+     })
+@@ -475,6 +481,7 @@ async fn handle_socket(
+     session_id: Option<String>,
+     session_name: Option<String>,
+     session_cwd: Option<String>,
++    session_model_provider: Option<String>,
+     // The transport-authenticated approval subject (paired-token hash), if the
+     // connection was authenticated. Threaded to SOP approval frames so a policied
+     // gate can be satisfied by an identified WS caller.
+@@ -741,6 +748,23 @@ async fn handle_socket(
+     // so this must stay `wss` or a single turn is split across two names.
+     // The back-channel is registered under the same `wss` key below, which is
+     // what lets ask_user/poll/escalate_to_human default to this conversation.
++    if let Some(ref provider_ref) = session_model_provider
++        && let Err(e) = agent.override_model_provider(provider_ref)
++    {
++        let err = serde_json::json!({
++            "type": "error",
++            "message": format!("model_provider: {e}"),
++            "code": "INVALID_MODEL_PROVIDER"
++        });
++        let _ = sender.send(Message::Text(err.to_string().into())).await;
++        let _ = sender
++            .send(Message::Close(Some(axum::extract::ws::CloseFrame {
++                code: 1008,
++                reason: axum::extract::ws::Utf8Bytes::from_static("invalid model_provider"),
++            })))
++            .await;
++        return;
++    }
+     agent.set_channel_name(WS_CHANNEL_KEY.to_string());
+     agent.set_memory_session_id(Some(memory_session_id));
+     // How much of the persisted transcript this connection's history reflects.
+diff --git a/crates/zeroclaw-runtime/src/agent/agent.rs b/crates/zeroclaw-runtime/src/agent/agent.rs
+index 2727a63af..9669aae89 100644
+--- a/crates/zeroclaw-runtime/src/agent/agent.rs
++++ b/crates/zeroclaw-runtime/src/agent/agent.rs
+@@ -3561,6 +3561,36 @@ impl Agent {
+         Ok(())
+     }
+ 
++    /// Per-session model override, e.g. gateway `/ws/chat?model_provider=<family>.<alias>`:
++    /// switches this agent instance (one conversation) to a configured provider
++    /// profile and that profile's model. Config is not touched, so other
++    /// sessions keep the agent's own `model_provider`.
++    pub fn override_model_provider(&mut self, provider_ref: &str) -> anyhow::Result<()> {
++        let (family, alias) = provider_ref.split_once('.').ok_or_else(|| {
++            anyhow::anyhow!("model_provider must be a <family>.<alias> profile ref, got `{provider_ref}`")
++        })?;
++        let model = {
++            let config = self
++                .full_config()
++                .ok_or_else(|| anyhow::anyhow!("agent has no config to resolve `{provider_ref}`"))?;
++            let entry = config.providers.models.find(family, alias).ok_or_else(|| {
++                anyhow::anyhow!("unknown model_provider `{provider_ref}`: no [providers.models.{family}.{alias}]")
++            })?;
++            entry
++                .model
++                .clone()
++                .ok_or_else(|| anyhow::anyhow!("[providers.models.{family}.{alias}] has no model"))?
++        };
++        if self.model_provider_name == provider_ref && self.model_name == model {
++            return Ok(());
++        }
++        let current = self.model_name.clone();
++        match self.try_apply_model_switch(&current, provider_ref.to_string(), model) {
++            Some(_) => Ok(()),
++            None => anyhow::bail!("could not build model provider `{provider_ref}` (see daemon log)"),
++        }
++    }
++
+     fn try_apply_model_switch(
+         &mut self,
+         current_effective_model: &str,
+-- 
+2.56.0
+

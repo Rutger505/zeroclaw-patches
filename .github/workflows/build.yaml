@@ -21,6 +21,12 @@ concurrency:
 env:
   TARGET: x86_64-unknown-linux-gnu
   GH_TOKEN: ${{ github.token }}
+  # Upstream ships fat LTO + 1 codegen unit: ~12 min single-threaded link.
+  # Thin + 16 is ~10 min faster, binary a bit bigger.
+  # Job-level on purpose: rust-cache hashes CARGO_* env into its key, so a
+  # change here starts a fresh cache that also holds the test profile.
+  CARGO_PROFILE_RELEASE_LTO: thin
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
 
 jobs:
   build:

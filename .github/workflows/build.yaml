@@ -58,14 +58,18 @@ jobs:
           ref: ${{ steps.rel.outputs.upstream }}
           path: zeroclaw
 
+      # git am, not git apply: a dirty tree stamps the binary -dirty.
       - name: Apply patches
         working-directory: zeroclaw
         run: |
+          git config user.name github-actions
+          git config user.email github-actions@users.noreply.github.com
           grep -vE '^\s*(#|$)' ../.zcp/patches/series | while read -r p; do
             echo "applying $p"
-            git apply --verbose "../.zcp/patches/$p"
+            git am --3way "../.zcp/patches/$p"
           done
-          git diff --stat
+          git log --oneline -n 5
+          test -z "$(git status --porcelain --untracked-files=no)"
 
       - name: Rust toolchain
         working-directory: zeroclaw
@@ -89,6 +93,9 @@ jobs:
 
       - name: Build binaries
         working-directory: zeroclaw
+        env:
+          # --version shows "0.8.7 (v0.8.7-p2)" instead of git describe.
+          ZEROCLAW_BUILD_ID: ${{ steps.rel.outputs.tag }}
         run: |
           features="$(cargo run --quiet -p xtask --bin generate -- features --selection dist --target "$TARGET")"
           echo "features: $features"

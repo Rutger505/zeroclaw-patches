@@ -1,0 +1,493 @@
+From e33c367766af1d58ce605bf189660d23af746196 Mon Sep 17 00:00:00 2001
+From: Rocky <rocky@zeroclaw>
+Date: Mon, 9 Nov 2026 20:17:20 +0000
+Subject: [PATCH] feat(gateway): ask_user over /ws/chat
+
+WsApprovalChannel answers ask_user (free-form and choices) through the
+connected client instead of failing: it emits an ask_user frame
+{request_id, question, choices, timeout_secs} and parks until the client
+sends ask_user_response {request_id, answer}. Timeout or a detached client
+is a tool error. New Channel::request_text for free-form questions on
+channels without a send+listen flow.
+---
+ crates/zeroclaw-api/src/agent.rs              |   9 +
+ crates/zeroclaw-api/src/channel.rs            |  12 ++
+ crates/zeroclaw-channels/src/paced_channel.rs |   4 +
+ crates/zeroclaw-gateway/src/ws.rs             | 106 +++++++----
+ crates/zeroclaw-gateway/src/ws_approval.rs    | 165 +++++++++++++++++-
+ crates/zeroclaw-tools/src/ask_user.rs         |  41 ++++-
+ 6 files changed, 295 insertions(+), 42 deletions(-)
+
+diff --git a/crates/zeroclaw-api/src/agent.rs b/crates/zeroclaw-api/src/agent.rs
+index f99d6eb..8823a9e 100644
+--- a/crates/zeroclaw-api/src/agent.rs
++++ b/crates/zeroclaw-api/src/agent.rs
+@@ -134,6 +134,15 @@ pub enum TurnEvent {
+         /// How long the channel will wait before auto-denying.
+         timeout_secs: u64,
+     },
++    /// `ask_user` question for the connected client. The matching
++    /// `ask_user_response` frame must echo `request_id` and carry the answer.
++    AskUser {
++        request_id: String,
++        question: String,
++        /// Empty for a free-form question.
++        choices: Vec<String>,
++        timeout_secs: u64,
++    },
+     /// Older whole turns were dropped to fit either the context token budget or
+     /// the configured turn limit. Surfaces a user-visible "context was cut
+     /// here" marker so trimming is never silent. Emitted whenever a trim occurs.
+diff --git a/crates/zeroclaw-api/src/channel.rs b/crates/zeroclaw-api/src/channel.rs
+index cd9e35e..ffd2c53 100644
+--- a/crates/zeroclaw-api/src/channel.rs
++++ b/crates/zeroclaw-api/src/channel.rs
+@@ -1478,6 +1478,18 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
+         Ok(None)
+     }
+ 
++    /// Ask a free-form question and return the typed answer, for channels
++    /// whose generic `send` + `listen` flow can't carry a reply (e.g. the
++    /// gateway WebSocket). `Ok(None)` = not handled natively; the caller falls
++    /// back to `send` + `listen` when [`Self::supports_free_form_ask`] allows.
++    async fn request_text(
++        &self,
++        _question: &str,
++        _timeout: std::time::Duration,
++    ) -> anyhow::Result<Option<String>> {
++        Ok(None)
++    }
++
+     async fn request_multi_choice(
+         &self,
+         _question: &str,
+diff --git a/crates/zeroclaw-channels/src/paced_channel.rs b/crates/zeroclaw-channels/src/paced_channel.rs
+index f24481b..6999d82 100644
+--- a/crates/zeroclaw-channels/src/paced_channel.rs
++++ b/crates/zeroclaw-channels/src/paced_channel.rs
+@@ -592,6 +592,10 @@ impl Channel for PacedChannel {
+         self.inner.request_choice(question, choices, timeout).await
+     }
+ 
++    async fn request_text(&self, question: &str, timeout: Duration) -> Result<Option<String>> {
++        self.inner.request_text(question, timeout).await
++    }
++
+     async fn request_multi_choice(
+         &self,
+         question: &str,
+diff --git a/crates/zeroclaw-gateway/src/ws.rs b/crates/zeroclaw-gateway/src/ws.rs
+index 029f040..6633f49 100644
+--- a/crates/zeroclaw-gateway/src/ws.rs
++++ b/crates/zeroclaw-gateway/src/ws.rs
+@@ -8,7 +8,9 @@ use super::{
+     AppState, GW_SESSION_PREFIX, gateway_cancel_key, register_cancel_token,
+     remove_cancel_token_if_current,
+ };
+-use crate::ws_approval::{PendingApprovals, WsApprovalChannel, new_pending_approvals};
++use crate::ws_approval::{
++    PendingApprovals, WsApprovalChannel, new_pending_approvals, resolve_answer, resolve_approval,
++};
+ use axum::{
+     extract::{
+         Query, State, WebSocketUpgrade,
+@@ -1007,14 +1009,18 @@ async fn handle_socket(
+                         let _ = sender.send(Message::Text(err.to_string().into())).await;
+                         continue;
+                     }
+-                    if let Some(tx) = pending_approvals.lock().remove(request_id) {
+-                        let _ = tx.send(decision.expect("checked above"));
+-                    } else {
++                    if !resolve_approval(&pending_approvals, request_id, decision.expect("checked above")) {
+                         ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"request_id": request_id})), "approval_response with no matching pending request");
+                     }
+                     continue;
+                 }
+ 
++                // ── ask_user_response outside a turn: the question is gone ──
++                if msg_type == "ask_user_response" {
++                    ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"request_id": parsed["request_id"].as_str().unwrap_or("")})), "ask_user_response with no running turn");
++                    continue;
++                }
++
+                 if msg_type != "message" {
+                     let err = serde_json::json!({
+                         "type": "error",
+@@ -2068,12 +2074,30 @@ async fn process_chat_message(
+                                         if request_id.is_empty() || decision.is_none() {
+                                             continue;
+                                         }
+-                                        if let Some(tx) = pending_approvals.lock().remove(request_id) {
+-                                            let _ = tx.send(decision.expect("checked above"));
+-                                        } else {
++                                        if !resolve_approval(pending_approvals, request_id, decision.expect("checked above")) {
+                                             ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"request_id": request_id})), "approval_response with no matching pending request (mid-turn)");
+                                         }
+                                     }
++                                    Some("ask_user_response") => {
++                                        let request_id = parsed["request_id"].as_str().unwrap_or("");
++                                        let Some(answer) = parsed["answer"].as_str() else {
++                                            let err = serde_json::json!({
++                                                "type": "error",
++                                                "message": "ask_user_response requires request_id and answer (string)",
++                                                "code": "INVALID_ASK_USER_RESPONSE"
++                                            });
++                                            let _ = sender.send(Message::Text(err.to_string().into())).await;
++                                            continue;
++                                        };
++                                        if !resolve_answer(pending_approvals, request_id, answer.to_string()) {
++                                            let err = serde_json::json!({
++                                                "type": "error",
++                                                "message": format!("no pending ask_user question {request_id} (answered, timed out or unknown)"),
++                                                "code": "ASK_USER_NOT_PENDING"
++                                            });
++                                            let _ = sender.send(Message::Text(err.to_string().into())).await;
++                                        }
++                                    }
+                                     Some("message") => {
+                                         let content = parsed["content"].as_str().unwrap_or("").to_string();
+                                         if content.is_empty() {
+@@ -2110,30 +2134,50 @@ async fn process_chat_message(
+                             }
+                             approval = approval_event_rx.recv() => {
+                                 let Some(event) = approval else { continue };
+-                                if let TurnEvent::ApprovalRequest {
+-                                    request_id,
+-                                    tool_name,
+-                                    arguments_summary,
+-                                    timeout_secs,
+-                                } = event {
+-                                    if client_gone {
+-                                        // Nobody is attached to answer: drop the parked
+-                                        // oneshot so the approval channel resolves it as an
+-                                        // unreachable-operator deny now, not at the timeout.
+-                                        drop(pending_approvals.lock().remove(&request_id));
+-                                        continue;
++                                let (request_id, frame) = match event {
++                                    TurnEvent::ApprovalRequest {
++                                        request_id,
++                                        tool_name,
++                                        arguments_summary,
++                                        timeout_secs,
++                                    } => {
++                                        let frame = serde_json::json!({
++                                            "type": "approval_request",
++                                            "request_id": request_id,
++                                            "tool": tool_name,
++                                            "arguments_summary": arguments_summary,
++                                            "timeout_secs": timeout_secs,
++                                        });
++                                        (request_id, frame)
+                                     }
+-                                    let frame = serde_json::json!({
+-                                        "type": "approval_request",
+-                                        "request_id": request_id,
+-                                        "tool": tool_name,
+-                                        "arguments_summary": arguments_summary,
+-                                        "timeout_secs": timeout_secs,
+-                                    });
+-                                    if sender.send(Message::Text(frame.to_string().into())).await.is_err() {
+-                                        detach_mid_turn(session_key, &turn_id, pending_approvals);
+-                                        client_gone = true;
++                                    TurnEvent::AskUser {
++                                        request_id,
++                                        question,
++                                        choices,
++                                        timeout_secs,
++                                    } => {
++                                        let frame = serde_json::json!({
++                                            "type": "ask_user",
++                                            "request_id": request_id,
++                                            "question": question,
++                                            "choices": choices,
++                                            "timeout_secs": timeout_secs,
++                                        });
++                                        (request_id, frame)
+                                     }
++                                    _ => continue,
++                                };
++                                if client_gone {
++                                    // Nobody is attached to answer: drop the parked
++                                    // oneshot so the channel fails it closed now
++                                    // (approval: unreachable deny, ask_user: error),
++                                    // not at the timeout.
++                                    drop(pending_approvals.lock().remove(&request_id));
++                                    continue;
++                                }
++                                if sender.send(Message::Text(frame.to_string().into())).await.is_err() {
++                                    detach_mid_turn(session_key, &turn_id, pending_approvals);
++                                    client_gone = true;
+                                 }
+                             }
+                             _ = tick_websocket_ping(ping_interval), if !client_gone => {
+@@ -4850,7 +4894,9 @@ data: {{\"type\":\"message_stop\"}}\n\n"
+     fn detach_mid_turn_drops_parked_approvals_so_they_fail_closed() {
+         let pending = new_pending_approvals();
+         let (tx, rx) = tokio::sync::oneshot::channel::<ChannelApprovalResponse>();
+-        pending.lock().insert("req-1".to_string(), tx);
++        pending
++            .lock()
++            .insert("req-1".to_string(), crate::ws_approval::PendingReply::Approval(tx));
+ 
+         detach_mid_turn("gw_detached", "turn-1", &pending);
+ 
+diff --git a/crates/zeroclaw-gateway/src/ws_approval.rs b/crates/zeroclaw-gateway/src/ws_approval.rs
+index b9ae74e..642ca73 100644
+--- a/crates/zeroclaw-gateway/src/ws_approval.rs
++++ b/crates/zeroclaw-gateway/src/ws_approval.rs
+@@ -15,9 +15,47 @@ use zeroclaw_api::channel::{
+     ChannelApprovalResponse, ChannelMessage, SendMessage,
+ };
+ 
++/// A parked prompt waiting for the client: a tool approval or an `ask_user`
++/// answer.
++pub enum PendingReply {
++    Approval(oneshot::Sender<ChannelApprovalResponse>),
++    Answer(oneshot::Sender<String>),
++}
++
+ /// Shared map keyed by `request_id`. Consumed by the receive loop to resolve
+-/// the oneshot when an `approval_response` frame arrives.
+-pub type PendingApprovals = Arc<Mutex<HashMap<String, oneshot::Sender<ChannelApprovalResponse>>>>;
++/// the oneshot when an `approval_response` or `ask_user_response` frame
++/// arrives. Dropping an entry (detach) fails the waiter closed.
++pub type PendingApprovals = Arc<Mutex<HashMap<String, PendingReply>>>;
++
++/// Resolve a parked `ask_user` question. `false` when no question with that
++/// id is waiting (answered, timed out, or an approval id).
++pub fn resolve_answer(pending: &PendingApprovals, request_id: &str, answer: String) -> bool {
++    let mut guard = pending.lock();
++    if !matches!(guard.get(request_id), Some(PendingReply::Answer(_))) {
++        return false;
++    }
++    match guard.remove(request_id) {
++        Some(PendingReply::Answer(tx)) => tx.send(answer).is_ok(),
++        _ => false,
++    }
++}
++
++/// Resolve a parked tool approval. `false` when no approval with that id is
++/// waiting.
++pub fn resolve_approval(
++    pending: &PendingApprovals,
++    request_id: &str,
++    decision: ChannelApprovalResponse,
++) -> bool {
++    let mut guard = pending.lock();
++    if !matches!(guard.get(request_id), Some(PendingReply::Approval(_))) {
++        return false;
++    }
++    match guard.remove(request_id) {
++        Some(PendingReply::Approval(tx)) => tx.send(decision).is_ok(),
++        _ => false,
++    }
++}
+ 
+ /// Construct an empty pending-approvals registry for a fresh connection.
+ pub fn new_pending_approvals() -> PendingApprovals {
+@@ -34,6 +72,45 @@ pub struct WsApprovalChannel {
+ }
+ 
+ impl WsApprovalChannel {
++    /// Park an `ask_user` question on the client and wait for its answer.
++    /// Timeout and a detached client are errors, so ask_user reports them
++    /// instead of treating them as "not handled".
++    async fn ask(
++        &self,
++        question: &str,
++        choices: &[String],
++        timeout: Duration,
++    ) -> anyhow::Result<String> {
++        let request_id = Uuid::new_v4().to_string();
++        let (tx, rx) = oneshot::channel();
++        self.pending
++            .lock()
++            .insert(request_id.clone(), PendingReply::Answer(tx));
++
++        let event = TurnEvent::AskUser {
++            request_id: request_id.clone(),
++            question: question.to_string(),
++            choices: choices.to_vec(),
++            timeout_secs: timeout.as_secs(),
++        };
++        if self.event_tx.send(event).await.is_err() {
++            self.pending.lock().remove(&request_id);
++            anyhow::bail!("WebSocket client is gone; nobody to ask");
++        }
++
++        match tokio::time::timeout(timeout, rx).await {
++            Ok(Ok(answer)) => Ok(answer),
++            Ok(Err(_)) => {
++                self.pending.lock().remove(&request_id);
++                anyhow::bail!("WebSocket client detached before answering")
++            }
++            Err(_) => {
++                self.pending.lock().remove(&request_id);
++                anyhow::bail!("No response received within {} seconds", timeout.as_secs())
++            }
++        }
++    }
++
+     pub fn new(
+         event_tx: mpsc::Sender<TurnEvent>,
+         pending: PendingApprovals,
+@@ -91,6 +168,23 @@ impl Channel for WsApprovalChannel {
+         false
+     }
+ 
++    async fn request_choice(
++        &self,
++        question: &str,
++        choices: &[String],
++        timeout: Duration,
++    ) -> anyhow::Result<Option<String>> {
++        self.ask(question, choices, timeout).await.map(Some)
++    }
++
++    async fn request_text(
++        &self,
++        question: &str,
++        timeout: Duration,
++    ) -> anyhow::Result<Option<String>> {
++        self.ask(question, &[], timeout).await.map(Some)
++    }
++
+     /// Delegates to [`Self::request_approval_attributed`] and drops the
+     /// provenance, so the prompt/timeout logic lives in exactly one place.
+     async fn request_approval(
+@@ -111,7 +205,9 @@ impl Channel for WsApprovalChannel {
+     ) -> anyhow::Result<Option<AttributedApprovalResponse>> {
+         let request_id = Uuid::new_v4().to_string();
+         let (tx, rx) = oneshot::channel();
+-        self.pending.lock().insert(request_id.clone(), tx);
++        self.pending
++            .lock()
++            .insert(request_id.clone(), PendingReply::Approval(tx));
+ 
+         let event = TurnEvent::ApprovalRequest {
+             request_id: request_id.clone(),
+@@ -172,6 +268,69 @@ mod tests {
+         );
+     }
+ 
++    #[tokio::test]
++    async fn ask_emits_question_and_returns_the_answer() {
++        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
++        let pending = new_pending_approvals();
++        let channel = WsApprovalChannel::new(tx, Arc::clone(&pending), Duration::from_secs(30));
++
++        let call = async {
++            channel
++                .request_text("Discord user id?", Duration::from_secs(5))
++                .await
++        };
++        let answerer = async {
++            let Some(TurnEvent::AskUser {
++                request_id,
++                question,
++                choices,
++                timeout_secs,
++            }) = rx.recv().await
++            else {
++                panic!("expected an AskUser event");
++            };
++            assert_eq!(question, "Discord user id?");
++            assert!(choices.is_empty());
++            assert_eq!(timeout_secs, 5);
++            assert!(resolve_answer(&pending, &request_id, "1234".into()));
++        };
++        let (result, ()) = tokio::join!(call, answerer);
++        assert_eq!(result.unwrap().as_deref(), Some("1234"));
++        assert!(pending.lock().is_empty());
++    }
++
++    #[tokio::test]
++    async fn ask_times_out_with_an_error() {
++        let (tx, _rx) = tokio::sync::mpsc::channel(8);
++        let pending = new_pending_approvals();
++        let channel = WsApprovalChannel::new(tx, Arc::clone(&pending), Duration::from_secs(30));
++        let err = channel
++            .request_choice("pick", &["a".into(), "b".into()], Duration::from_millis(50))
++            .await
++            .expect_err("timeout is an error");
++        assert!(err.to_string().contains("No response"));
++        assert!(pending.lock().is_empty());
++    }
++
++    #[test]
++    fn answer_and_approval_ids_do_not_cross() {
++        let pending = new_pending_approvals();
++        let (atx, _arx) = oneshot::channel::<ChannelApprovalResponse>();
++        pending
++            .lock()
++            .insert("approval".into(), PendingReply::Approval(atx));
++        assert!(!resolve_answer(&pending, "approval", "x".into()));
++        assert!(pending.lock().contains_key("approval"));
++        let (qtx, _qrx) = oneshot::channel::<String>();
++        pending.lock().insert("question".into(), PendingReply::Answer(qtx));
++        assert!(!resolve_approval(
++            &pending,
++            "question",
++            ChannelApprovalResponse::Approve
++        ));
++        assert!(pending.lock().contains_key("question"));
++    }
++
+     fn approval_request() -> ChannelApprovalRequest {
+         ChannelApprovalRequest {
+             tool_name: "file_write".to_string(),
+diff --git a/crates/zeroclaw-tools/src/ask_user.rs b/crates/zeroclaw-tools/src/ask_user.rs
+index 814de60..e742a72 100644
+--- a/crates/zeroclaw-tools/src/ask_user.rs
++++ b/crates/zeroclaw-tools/src/ask_user.rs
+@@ -230,15 +230,38 @@ impl Tool for AskUserTool {
+                     });
+                 }
+             }
+-        } else if !channel.supports_free_form_ask() {
+-            return Ok(ToolResult {
+-                success: false,
+-                output: ToolOutput::default(),
+-                error: Some(format!(
+-                    "Channel '{channel_name}' requires `choices` for ask_user \
+-                     (free-form questions await ACP elicitation Phase 2)"
+-                )),
+-            });
++        } else {
++            match channel.request_text(&question, timeout).await {
++                Ok(Some(answer)) => {
++                    return Ok(ToolResult {
++                        success: true,
++                        output: answer.into(),
++                        error: None,
++                    });
++                }
++                Ok(None) if channel.supports_free_form_ask() => {
++                    /* fall through to send+listen */
++                }
++                Ok(None) => {
++                    return Ok(ToolResult {
++                        success: false,
++                        output: ToolOutput::default(),
++                        error: Some(format!(
++                            "Channel '{channel_name}' requires `choices` for ask_user \
++                             (free-form questions await ACP elicitation Phase 2)"
++                        )),
++                    });
++                }
++                Err(e) => {
++                    return Ok(ToolResult {
++                        success: false,
++                        output: ToolOutput::default(),
++                        error: Some(format!(
++                            "Failed to ask question on channel '{channel_name}': {e}"
++                        )),
++                    });
++                }
++            }
+         }
+ 
+         // Format and send the question
+-- 
+2.56.0
+

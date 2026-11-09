@@ -1,0 +1,167 @@
+From 6a4f449550a9556a8decd0cf4f73e944fe716766 Mon Sep 17 00:00:00 2001
+From: Rutger Pronk <rutger.pronk11@gmail.com>
+Date: Mon, 9 Nov 2026 09:39:14 +0000
+Subject: [PATCH] fix(daemon): stop within milliseconds on SIGTERM
+
+A daemon stop with a turn running hung until systemd's SIGKILL (90 s):
+the agent-lifecycle drain waited without limit for admitted agent work,
+e.g. a tool that itself waits for this restart. Even idle, every stop
+took 500 ms: the status writer never ends, so the component grace window
+always ran out on it.
+
+- Shutdown (not reload): agent drain bounded to 250 ms, channel
+  supervisor grace 500 ms instead of 6 s. The process exit ends whatever
+  still runs.
+- Status writer aborted at teardown, outside the grace window.
+- Runtime shut down with a 100 ms timeout instead of dropped: dropping
+  waits without limit for spawn_blocking work.
+
+Reload keeps the full drains: it hands over to a new generation in the
+same process.
+---
+ crates/zeroclaw-runtime/src/daemon/mod.rs | 55 ++++++++++++++++++++---
+ src/main.rs                               | 11 +++--
+ 2 files changed, 56 insertions(+), 10 deletions(-)
+
+diff --git a/crates/zeroclaw-runtime/src/daemon/mod.rs b/crates/zeroclaw-runtime/src/daemon/mod.rs
+index 1c2b2aa..6acd9ae 100644
+--- a/crates/zeroclaw-runtime/src/daemon/mod.rs
++++ b/crates/zeroclaw-runtime/src/daemon/mod.rs
+@@ -755,7 +755,11 @@ pub async fn run_with_authority(
+ 
+     crate::agent::pricing_catalog::load_global_pricing_catalog(&config.data_dir);
+ 
+-    let mut handles: Vec<JoinHandle<()>> = vec![spawn_state_writer(config.clone())];
++    // Kept out of `handles`: an endless flush loop that never sees a
++    // cancellation token, so the grace window below always ran out on it and
++    // added 500 ms to every stop. Aborted at teardown instead.
++    let state_writer = spawn_state_writer(config.clone());
++    let mut handles: Vec<JoinHandle<()>> = Vec::new();
+     let mut channels_handle: Option<JoinHandle<()>> = None;
+ 
+     // Reload channel: gateway's /admin/reload writes here; our wait loop
+@@ -1416,13 +1420,24 @@ pub async fn run_with_authority(
+     // Keep that supervisor out of the generic 500 ms component pool: its
+     // internal absolute deadline is five seconds, and a reload may start a
+     // replacement generation only after this owner has actually retired.
+-    let channels_retired = retire_channels_supervisor(channels_handle).await;
++    let shutting_down = !matches!(&exit_result, Ok(DaemonExit::Reload));
++    let channels_retired = retire_channels_supervisor(
++        channels_handle,
++        if shutting_down {
++            SHUTDOWN_CHANNEL_GRACE
++        } else {
++            CHANNEL_SUPERVISOR_SHUTDOWN_GRACE
++        },
++    )
++    .await;
+     let exit_result = settle_exit_against_channel_retirement(exit_result, channels_retired);
+ 
+     // Grace window for cooperative shutdown of each component supervisor. The
+     // RPC listeners are already past their own drain by this point, so this
+     // only covers the supervisor loop returning after its component did.
+     const GRACE_WINDOW: Duration = Duration::from_millis(500);
++    state_writer.abort();
++    let _ = state_writer.await;
+     let deadline = tokio::time::Instant::now() + GRACE_WINDOW;
+     let mut remaining: Vec<JoinHandle<()>> = Vec::new();
+     for mut handle in handles {
+@@ -1455,7 +1470,27 @@ pub async fn run_with_authority(
+             .await;
+         live_config_authority.take_process_ownership()
+     } else {
+-        live_config_authority.drain_agent_lifecycle().await;
++        // The process exits right after this, which ends any turn still
++        // running. Waiting for it to finish could take minutes or forever
++        // (a tool waiting on this very restart) until systemd SIGKILLs us, so
++        // only give in-flight final writes a moment.
++        if tokio::time::timeout(
++            SHUTDOWN_AGENT_DRAIN,
++            live_config_authority.drain_agent_lifecycle(),
++        )
++        .await
++        .is_err()
++        {
++            ::zeroclaw_log::record!(
++                WARN,
++                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
++                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
++                    .with_attrs(::serde_json::json!({
++                        "waited_ms": SHUTDOWN_AGENT_DRAIN.as_millis() as u64,
++                    })),
++                "Agent work still running at shutdown; exiting without it"
++            );
++        }
+         None
+     };
+ 
+@@ -1703,8 +1738,13 @@ fn settle_exit_against_drain(exit: Result<DaemonExit>, drain: RpcDrain) -> Resul
+ }
+ 
+ const CHANNEL_SUPERVISOR_SHUTDOWN_GRACE: Duration = Duration::from_secs(6);
++/// Process shutdown (not reload): nothing replaces the channels or the agent
++/// work, and the process exit ends whatever is still running, so these only
++/// cover work that is about to finish anyway.
++const SHUTDOWN_CHANNEL_GRACE: Duration = Duration::from_millis(500);
++const SHUTDOWN_AGENT_DRAIN: Duration = Duration::from_millis(250);
+ 
+-async fn retire_channels_supervisor(handle: Option<JoinHandle<()>>) -> bool {
++async fn retire_channels_supervisor(handle: Option<JoinHandle<()>>, grace: Duration) -> bool {
+     let Some(mut handle) = handle else {
+         return true;
+     };
+@@ -1724,7 +1764,7 @@ async fn retire_channels_supervisor(handle: Option<JoinHandle<()>>) -> bool {
+                 true
+             }
+         }
+-        () = tokio::time::sleep(CHANNEL_SUPERVISOR_SHUTDOWN_GRACE) => {
++        () = tokio::time::sleep(grace) => {
+             handle.abort();
+             let _ = handle.await;
+             ::zeroclaw_log::record!(
+@@ -3238,7 +3278,7 @@ mod tests {
+         });
+ 
+         assert!(
+-            retire_channels_supervisor(Some(handle)).await,
++            retire_channels_supervisor(Some(handle), CHANNEL_SUPERVISOR_SHUTDOWN_GRACE).await,
+             "channel cleanup longer than the generic 500 ms grace must still retire cleanly"
+         );
+         assert!(
+@@ -3263,7 +3303,8 @@ mod tests {
+             std::future::pending::<()>().await;
+         });
+ 
+-        let retired = retire_channels_supervisor(Some(handle)).await;
++        let retired =
++            retire_channels_supervisor(Some(handle), CHANNEL_SUPERVISOR_SHUTDOWN_GRACE).await;
+         assert!(!retired, "a timed-out channel generation is not retired");
+         assert!(
+             dropped.load(std::sync::atomic::Ordering::SeqCst),
+diff --git a/src/main.rs b/src/main.rs
+index 3b8fd34..9e5451f 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -9011,11 +9011,16 @@ fn main() -> Result<()> {
+ /// abort the daemon. The size matches the 8 MiB main-thread stacks the
+ /// workspace already requests via linker args on other targets.
+ fn async_main(command: clap::Command) -> Result<()> {
+-    tokio::runtime::Builder::new_multi_thread()
++    let runtime = tokio::runtime::Builder::new_multi_thread()
+         .enable_all()
+         .thread_stack_size(8 * 1024 * 1024)
+-        .build()?
+-        .block_on(async_main_inner(command))
++        .build()?;
++    let result = runtime.block_on(async_main_inner(command));
++    // Dropping the runtime waits without limit for spawn_blocking work (a tool
++    // still waiting on its child process, ...), which kept a stopping daemon
++    // alive until systemd's SIGKILL. The command has finished: don't wait.
++    runtime.shutdown_timeout(std::time::Duration::from_millis(100));
++    result
+ }
+ 
+ /// True when a desktop entry's `Name` deliberately identifies ZeroClaw: it is
+-- 
+2.56.0
+

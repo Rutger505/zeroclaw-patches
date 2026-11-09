@@ -13,6 +13,7 @@ The `zeroclaw` role in [homelab-infrastructure](https://github.com/Rutger505-Org
 ## Patches
 
 - `0001-gateway-ws-model-provider.patch`: `/ws/chat?model_provider=<family>.<alias>` sets the model for that conversation only, without touching config. Used by [someclaw](https://github.com/Rutger505/someclaw)'s model picker. Drop it once upstream has an equivalent.
+- `0002-daemon-fast-shutdown.patch`: SIGTERM stops the daemon in milliseconds: no unbounded wait for running turns (a tool waiting on the restart hung it until systemd's SIGKILL), no 500 ms grace on the status writer, runtime shutdown with a timeout. Reload unchanged.
 
 ## Workflow
 

@@ -2,3 +2,4 @@
 0001-gateway-ws-model-provider.patch
 0002-daemon-fast-shutdown.patch
 0003-gateway-ws-ask-user.patch
+0004-gateway-ws-attach.patch

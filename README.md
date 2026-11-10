@@ -15,6 +15,7 @@ The `zeroclaw` role in [homelab-infrastructure](https://github.com/Rutger505-Org
 - `0001-gateway-ws-model-provider.patch`: `/ws/chat?model_provider=<family>.<alias>` sets the model for that conversation only, without touching config. Used by [someclaw](https://github.com/Rutger505/someclaw)'s model picker. Drop it once upstream has an equivalent.
 - `0002-daemon-fast-shutdown.patch`: SIGTERM stops the daemon in milliseconds: no unbounded wait for running turns (a tool waiting on the restart hung it until systemd's SIGKILL), no 500 ms grace on the status writer, runtime shutdown with a timeout. Reload unchanged.
 - `0003-gateway-ws-ask-user.patch`: `ask_user` works on `/ws/chat` (channel `wss`), free-form and with choices: gateway sends `{type:"ask_user", request_id, question, choices, timeout_secs}`, client answers `{type:"ask_user_response", request_id, answer}`. Timeout/detach = tool error. Used by someclaw's question card.
+- `0004-gateway-ws-attach.patch`: a second socket on a session follows its running turn: `{type:"attach"}` → `{type:"attached", running, turn_id, replayed}`, the turn's frames so far (streamed deltas merged), then live up to `done`/`aborted`/`error`. Read-only (`ATTACHED_READ_ONLY`). Used by someclaw to show steps after its own restart mid-turn.
 
 ## Workflow
 

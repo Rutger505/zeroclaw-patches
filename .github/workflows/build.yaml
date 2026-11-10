@@ -95,7 +95,7 @@ jobs:
 
       - name: Test patched code
         working-directory: zeroclaw
-        run: cargo test --locked -p zeroclaw-gateway -p zeroclaw-tools --lib -- ws_approval ask_user detach_mid_turn
+        run: cargo test --locked -p zeroclaw-gateway -p zeroclaw-tools --lib -- ws_approval ask_user detach_mid_turn attach ws_turn_watch
 
       - name: Build web dashboard
         working-directory: zeroclaw

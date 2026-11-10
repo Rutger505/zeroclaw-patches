@@ -18,14 +18,14 @@ The `zeroclaw` role in [homelab-infrastructure](https://github.com/Rutger505-Org
 
 ## Workflow
 
-Changes go through a PR: CI applies the patches and builds, so a patch that no longer applies fails there. Merging publishes the release; then bump `zeroclaw_version` and `zeroclaw_sha256` in homelab-infrastructure.
+Commit straight to main: CI applies the patches, tests and builds, and publishes the release only when green (a failed build releases nothing, so the tag stays free). Then bump `zeroclaw_version` and `zeroclaw_sha256` in homelab-infrastructure.
 
 New upstream version:
 
 1. Set `ZEROCLAW_VERSION`, `PATCH_RELEASE=1`.
 2. Patch doesn't apply: clone upstream at the tag, `git am patches/*.patch`, fix, `git format-patch -o patches/ v<version>`.
-3. PR, green build, merge.
+3. Push to main, check the build.
 
-Changing a patch: edit it the same way, bump `PATCH_RELEASE`. A PR whose tag already exists fails on purpose.
+Changing a patch: edit it the same way, bump `PATCH_RELEASE` (main skips publishing when the tag already exists).
 
 Building on the zeroclaw VM is off limits: a release build runs it out of memory.

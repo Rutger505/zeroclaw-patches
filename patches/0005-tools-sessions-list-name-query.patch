@@ -1,0 +1,303 @@
+From ae5ed1815895775b2845d24f041f7eb65ec8fc2f Mon Sep 17 00:00:00 2001
+From: Rocky <rocky@zeroclaw>
+Date: Sat, 14 Nov 2026 18:08:12 +0000
+Subject: [PATCH 5/5] feat(tools): sessions_list shows session names and
+ searches with query
+
+sessions_list prints each session's name (session_metadata.name, the
+thread title) and takes an optional query that full-text searches
+sessions_fts via SessionBackend::search, returning only matching
+sessions. Without query it lists as before.
+
+SqliteSessionBackend::search now orders matches by last activity before
+applying the limit (was arbitrary) and doubles embedded quotes so a word
+with a quote no longer breaks the whole MATCH.
+---
+ crates/zeroclaw-infra/src/session_sqlite.rs |  43 ++++++-
+ crates/zeroclaw-tools/src/sessions.rs       | 134 +++++++++++++++++---
+ 2 files changed, 154 insertions(+), 23 deletions(-)
+
+diff --git a/crates/zeroclaw-infra/src/session_sqlite.rs b/crates/zeroclaw-infra/src/session_sqlite.rs
+index e30bcd015..93c419133 100644
+--- a/crates/zeroclaw-infra/src/session_sqlite.rs
++++ b/crates/zeroclaw-infra/src/session_sqlite.rs
+@@ -1524,21 +1524,24 @@ impl SessionBackend for SqliteSessionBackend {
+         #[allow(clippy::cast_possible_wrap)]
+         let limit = query.limit.unwrap_or(50) as i64;
+ 
+-        // FTS5 search
++        // FTS5 search, most recently active first (like list_sessions_with_metadata)
+         let mut stmt = match conn.prepare(
+-            "SELECT DISTINCT f.session_key
+-             FROM sessions_fts f
+-             WHERE sessions_fts MATCH ?1
++            "SELECT m.session_key
++             FROM session_metadata m
++             WHERE m.session_key IN
++                 (SELECT session_key FROM sessions_fts WHERE sessions_fts MATCH ?1)
++             ORDER BY m.last_activity DESC
+              LIMIT ?2",
+         ) {
+             Ok(s) => s,
+             Err(_) => return Vec::new(),
+         };
+ 
+-        // Quote each word for FTS5
++        // Quote each word for FTS5; an embedded quote is doubled, or the
++        // whole MATCH is a syntax error and nothing is found.
+         let fts_query: String = keyword
+             .split_whitespace()
+-            .map(|w| format!("\"{w}\""))
++            .map(|w| format!("\"{}\"", w.replace('"', "\"\"")))
+             .collect::<Vec<_>>()
+             .join(" OR ");
+ 
+@@ -1780,6 +1783,34 @@ mod tests {
+         assert_eq!(results[0].key, "code_chat");
+     }
+ 
++    #[test]
++    fn fts5_search_orders_by_activity_and_escapes_quotes() {
++        let tmp = TempDir::new().unwrap();
++        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
++
++        backend
++            .append("older", &ChatMessage::user("deploy the cluster"))
++            .unwrap();
++        std::thread::sleep(StdDuration::from_millis(50));
++        backend
++            .append("newer", &ChatMessage::user("deploy said \"done\""))
++            .unwrap();
++
++        let results = backend.search(&SessionQuery {
++            keyword: Some("deploy".into()),
++            limit: Some(10),
++        });
++        let keys: Vec<_> = results.iter().map(|m| m.key.as_str()).collect();
++        assert_eq!(keys, ["newer", "older"]);
++
++        let results = backend.search(&SessionQuery {
++            keyword: Some("\"done\"".into()),
++            limit: Some(10),
++        });
++        assert_eq!(results.len(), 1);
++        assert_eq!(results[0].key, "newer");
++    }
++
+     #[test]
+     fn fts5_update_trigger_syncs_index() {
+         let tmp = TempDir::new().unwrap();
+diff --git a/crates/zeroclaw-tools/src/sessions.rs b/crates/zeroclaw-tools/src/sessions.rs
+index a8d15aec6..7be8da3cc 100644
+--- a/crates/zeroclaw-tools/src/sessions.rs
++++ b/crates/zeroclaw-tools/src/sessions.rs
+@@ -11,7 +11,7 @@ use zeroclaw_config::policy::ToolOperation;
+ use zeroclaw_infra::acp_session_store::{
+     AcpSessionAccess, AcpSessionData, AcpSessionStore, AcpSessionSummary,
+ };
+-use zeroclaw_infra::session_backend::SessionBackend;
++use zeroclaw_infra::session_backend::{SessionBackend, SessionQuery};
+ 
+ static SESSIONS_SEND_DESCRIPTION: OnceLock<String> = OnceLock::new();
+ 
+@@ -250,7 +250,8 @@ impl SessionOwnershipScope {
+ 
+ // ── SessionsListTool ────────────────────────────────────────────────
+ 
+-/// Lists active sessions with their channel, last activity time, and message count.
++/// Lists active sessions with their name, channel, last activity time, and message
++/// count; `query` narrows them to a full-text match on their messages.
+ pub struct SessionsListTool {
+     backend: Arc<dyn SessionBackend>,
+     acp_sessions: Option<AcpSessionReadView>,
+@@ -282,7 +283,7 @@ impl Tool for SessionsListTool {
+     }
+ 
+     fn description(&self) -> &str {
+-        "List all active conversation sessions with their channel, last activity time, and message count."
++        "List conversation sessions with their name (thread title), channel, last activity time, and message count. Pass `query` to only return sessions whose messages match it (full-text, any word)."
+     }
+ 
+     fn parameters_schema(&self) -> serde_json::Value {
+@@ -292,6 +293,10 @@ impl Tool for SessionsListTool {
+                 "limit": {
+                     "type": "integer",
+                     "description": "Max sessions to return (default: 50)"
++                },
++                "query": {
++                    "type": "string",
++                    "description": "Full-text search over session messages; only matching sessions are returned. Omit to list all."
+                 }
+             }
+         })
+@@ -303,14 +308,25 @@ impl Tool for SessionsListTool {
+             .get("limit")
+             .and_then(serde_json::Value::as_u64)
+             .map_or(50, |v| v as usize);
+-
+-        let mut metadata: Vec<SessionListEntry> = self
+-            .backend
+-            .list_sessions_with_metadata()
++        let query = args
++            .get("query")
++            .and_then(serde_json::Value::as_str)
++            .map(str::trim)
++            .filter(|q| !q.is_empty());
++
++        let sessions = match query {
++            Some(q) => self.backend.search(&SessionQuery {
++                keyword: Some(q.to_string()),
++                limit: Some(limit),
++            }),
++            None => self.backend.list_sessions_with_metadata(),
++        };
++        let mut metadata: Vec<SessionListEntry> = sessions
+             .into_iter()
+             .map(|meta| SessionListEntry {
+                 channel: meta.key.split("__").next().unwrap_or(&meta.key).to_string(),
+                 key: meta.key,
++                name: meta.name,
+                 last_activity: meta.last_activity,
+                 message_count: meta.message_count,
+             })
+@@ -321,29 +337,45 @@ impl Tool for SessionsListTool {
+         {
+             let acp_ids = view.all_session_ids()?;
+             metadata.retain(|entry| !acp_ids.contains(&entry.key));
+-            metadata.extend(acp_sessions.into_iter().map(|summary| SessionListEntry {
+-                key: summary.session_uuid,
+-                channel: "acp".to_string(),
+-                last_activity: summary.last_activity,
+-                message_count: summary.message_count,
+-            }));
+-            metadata.sort_by_key(|entry| std::cmp::Reverse(entry.last_activity));
++            // ACP transcripts live outside the FTS index: a search can't match them.
++            if query.is_none() {
++                metadata.extend(acp_sessions.into_iter().map(|summary| SessionListEntry {
++                    key: summary.session_uuid,
++                    channel: "acp".to_string(),
++                    name: None,
++                    last_activity: summary.last_activity,
++                    message_count: summary.message_count,
++                }));
++                metadata.sort_by_key(|entry| std::cmp::Reverse(entry.last_activity));
++            }
+         }
+ 
+         if metadata.is_empty() {
++            let output = match query {
++                Some(q) => format!("No sessions matching '{q}'."),
++                None => "No active sessions found.".to_string(),
++            };
+             return Ok(ToolResult {
+                 success: true,
+-                output: "No active sessions found.".into(),
++                output: output.into(),
+                 error: None,
+             });
+         }
+ 
+         let capped: Vec<_> = metadata.into_iter().take(limit).collect();
+-        let mut output = format!("Found {} session(s):\n", capped.len());
++        let mut output = match query {
++            Some(q) => format!("Found {} session(s) matching '{q}':\n", capped.len()),
++            None => format!("Found {} session(s):\n", capped.len()),
++        };
+         for meta in &capped {
++            let name = meta
++                .name
++                .as_deref()
++                .map(|name| format!("name={name:?}, "))
++                .unwrap_or_default();
+             let _ = writeln!(
+                 output,
+-                "- {}: channel={}, messages={}, last_activity={}",
++                "- {}: {name}channel={}, messages={}, last_activity={}",
+                 meta.key, meta.channel, meta.message_count, meta.last_activity
+             );
+         }
+@@ -359,6 +391,7 @@ impl Tool for SessionsListTool {
+ struct SessionListEntry {
+     key: String,
+     channel: String,
++    name: Option<String>,
+     last_activity: chrono::DateTime<chrono::Utc>,
+     message_count: usize,
+ }
+@@ -1294,6 +1327,73 @@ mod tests {
+         assert!(tool.parameters_schema()["properties"]["limit"].is_object());
+     }
+ 
++    fn sqlite_backend() -> (TempDir, Arc<dyn SessionBackend>) {
++        let tmp = TempDir::new().unwrap();
++        let backend =
++            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap();
++        backend
++            .append("gw_alpha", &ChatMessage::user("Disk alert on the cluster"))
++            .unwrap();
++        backend
++            .append("gw_beta", &ChatMessage::user("Sync my Spotify playlist"))
++            .unwrap();
++        backend.set_session_name("gw_alpha", "Disk alert").unwrap();
++        (tmp, Arc::new(backend))
++    }
++
++    fn line_for<'a>(output: &'a str, key: &str) -> &'a str {
++        output
++            .lines()
++            .find(|line| line.starts_with(&format!("- {key}:")))
++            .unwrap_or_else(|| panic!("no line for {key} in {output}"))
++    }
++
++    #[tokio::test]
++    async fn sessions_list_shows_name() {
++        let (_tmp, backend) = sqlite_backend();
++        let tool = SessionsListTool::new(backend);
++        let result = tool.execute(json!({})).await.unwrap();
++        assert!(result.success);
++        assert!(result.output.contains("2 session(s)"));
++        assert!(line_for(&result.output, "gw_alpha").contains("name=\"Disk alert\", channel="));
++        assert!(!line_for(&result.output, "gw_beta").contains("name="));
++    }
++
++    #[tokio::test]
++    async fn sessions_list_query_returns_matches_with_name() {
++        let (_tmp, backend) = sqlite_backend();
++        let tool = SessionsListTool::new(backend);
++
++        let result = tool.execute(json!({"query": "cluster"})).await.unwrap();
++        assert!(result.success);
++        assert!(result.output.contains("1 session(s) matching 'cluster'"));
++        assert!(line_for(&result.output, "gw_alpha").contains("name=\"Disk alert\""));
++        assert!(!result.output.contains("gw_beta"));
++
++        let result = tool.execute(json!({"query": "spotify"})).await.unwrap();
++        assert!(result.output.contains("1 session(s) matching 'spotify'"));
++        assert!(result.output.contains("- gw_beta:"));
++        assert!(!result.output.contains("gw_alpha"));
++    }
++
++    #[tokio::test]
++    async fn sessions_list_query_without_match() {
++        let (_tmp, backend) = sqlite_backend();
++        let tool = SessionsListTool::new(backend);
++        let result = tool.execute(json!({"query": "kubernetes"})).await.unwrap();
++        assert!(result.success);
++        assert_eq!(&*result.output, "No sessions matching 'kubernetes'.");
++    }
++
++    #[tokio::test]
++    async fn sessions_list_blank_query_lists_all() {
++        let (_tmp, backend) = sqlite_backend();
++        let tool = SessionsListTool::new(backend);
++        let result = tool.execute(json!({"query": "  "})).await.unwrap();
++        assert!(result.output.starts_with("Found 2 session(s):"));
++        assert!(tool.parameters_schema()["properties"]["query"].is_object());
++    }
++
+     // ── SessionsHistoryTool tests ───────────────────────────────────
+ 
+     #[tokio::test]
+-- 
+2.56.1
+

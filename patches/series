@@ -3,3 +3,4 @@
 0002-daemon-fast-shutdown.patch
 0003-gateway-ws-ask-user.patch
 0004-gateway-ws-attach.patch
+0005-tools-sessions-list-name-query.patch

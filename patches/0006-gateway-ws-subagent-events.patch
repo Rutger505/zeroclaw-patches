@@ -1,0 +1,674 @@
+From 30ecca608aff13b0e58016ae7e33b084654afd14 Mon Sep 17 00:00:00 2001
+From: Rocky <rocky@zeroclaw>
+Date: Sun, 15 Nov 2026 21:51:16 +0000
+Subject: [PATCH] feat(gateway): stream spawn_subagent steps on /ws/chat
+
+A spawn_subagent call made by a turn that streams events now shows the
+subagent's run live on the parent's stream. Tool dispatch scopes a
+SubagentEventSink (task-local, keyed by the spawn's tool call id) around
+the spawn; the child run executes in the same task, so its tool dispatch
+mirrors each ToolCall/ToolResult into TurnEvent::Subagent and the spawn
+tool brackets the run with Start/End. /ws/chat renders them as
+{type:"subagent_event", parent_call_id, event} where event is
+subagent_start, a parent-shaped tool_call/tool_result, or subagent_end.
+Without a streaming parent (cron, other channels) nothing changes; the
+child's behaviour and its result to the parent are untouched.
+---
+ crates/zeroclaw-api/src/agent.rs              |  22 ++
+ crates/zeroclaw-gateway/src/ws.rs             | 112 +++++++-
+ crates/zeroclaw-runtime/src/agent/mod.rs      |   1 +
+ .../src/agent/subagent_events.rs              |  59 ++++
+ .../src/agent/tool_execution.rs               | 256 ++++++++++++++++--
+ .../src/tools/spawn_subagent.rs               |  60 ++++
+ 6 files changed, 480 insertions(+), 30 deletions(-)
+ create mode 100644 crates/zeroclaw-runtime/src/agent/subagent_events.rs
+
+diff --git a/crates/zeroclaw-api/src/agent.rs b/crates/zeroclaw-api/src/agent.rs
+index 8823a9e..62e904a 100644
+--- a/crates/zeroclaw-api/src/agent.rs
++++ b/crates/zeroclaw-api/src/agent.rs
+@@ -91,6 +91,20 @@ pub enum BudgetWarningPeriod {
+     Month,
+ }
+ 
++/// What a `spawn_subagent` run did, see [`TurnEvent::Subagent`].
++#[derive(Debug, Clone)]
++pub enum SubagentStep {
++    /// The subagent run starts.
++    Start { run_id: String },
++    /// One of the subagent's own events (`ToolCall` / `ToolResult`).
++    Event(Box<TurnEvent>),
++    /// The subagent run finished; `error` is set when it failed.
++    End {
++        success: bool,
++        error: Option<String>,
++    },
++}
++
+ #[non_exhaustive]
+ #[derive(Debug, Clone)]
+ pub enum TurnEvent {
+@@ -143,6 +157,14 @@ pub enum TurnEvent {
+         choices: Vec<String>,
+         timeout_secs: u64,
+     },
++    /// A step of a `spawn_subagent` run, tied to the parent's tool call.
++    /// Emitted only when the parent turn streams events; the subagent's own
++    /// behaviour and its result to the parent are unchanged.
++    Subagent {
++        /// `id` of the parent's `spawn_subagent` [`TurnEvent::ToolCall`].
++        parent_call_id: String,
++        step: SubagentStep,
++    },
+     /// Older whole turns were dropped to fit either the context token budget or
+     /// the configured turn limit. Surfaces a user-visible "context was cut
+     /// here" marker so trimming is never silent. Emitted whenever a trim occurs.
+diff --git a/crates/zeroclaw-gateway/src/ws.rs b/crates/zeroclaw-gateway/src/ws.rs
+index e5cda5a..33398ce 100644
+--- a/crates/zeroclaw-gateway/src/ws.rs
++++ b/crates/zeroclaw-gateway/src/ws.rs
+@@ -1418,6 +1418,45 @@ fn refresh_history_if_advanced(
+ }
+ 
+ /// The `history_trimmed` frame for a trim notice, or `None` for any other event.
++/// `tool_call` / `tool_result` frame for a tool event, `None` otherwise.
++fn tool_ws_frame(event: zeroclaw_api::agent::TurnEvent) -> Option<serde_json::Value> {
++    match event {
++        zeroclaw_api::agent::TurnEvent::ToolCall { id, name, args } => {
++            Some(serde_json::json!({ "type": "tool_call", "id": id, "name": name, "args": args }))
++        }
++        zeroclaw_api::agent::TurnEvent::ToolResult {
++            id, name, output, ..
++        } => Some(
++            serde_json::json!({ "type": "tool_result", "id": id, "name": name, "output": output }),
++        ),
++        _ => None,
++    }
++}
++
++/// `subagent_event` frame: one step of a `spawn_subagent` run, tied to the
++/// parent's `tool_call` `id`. `event` is a `subagent_start`, a
++/// `tool_call`/`tool_result` shaped like the parent's, or a `subagent_end`.
++fn subagent_ws_frame(
++    parent_call_id: String,
++    step: zeroclaw_api::agent::SubagentStep,
++) -> Option<serde_json::Value> {
++    use zeroclaw_api::agent::SubagentStep;
++    let event = match step {
++        SubagentStep::Start { run_id } => {
++            serde_json::json!({ "type": "subagent_start", "run_id": run_id })
++        }
++        SubagentStep::Event(event) => tool_ws_frame(*event)?,
++        SubagentStep::End { success, error } => {
++            serde_json::json!({ "type": "subagent_end", "success": success, "error": error })
++        }
++    };
++    Some(serde_json::json!({
++        "type": "subagent_event",
++        "parent_call_id": parent_call_id,
++        "event": event,
++    }))
++}
++
+ fn history_trimmed_frame_for(event: zeroclaw_api::agent::TurnEvent) -> Option<serde_json::Value> {
+     let zeroclaw_api::agent::TurnEvent::HistoryTrimmed {
+         dropped_messages,
+@@ -2282,13 +2321,13 @@ async fn process_chat_message(
+                                     TurnEvent::Thinking { delta } => {
+                                         serde_json::json!({ "type": "thinking", "content": delta })
+                                     }
+-                                    TurnEvent::ToolCall { id, name, args } => {
+-                                        serde_json::json!({ "type": "tool_call", "id": id, "name": name, "args": args })
++                                    tool_event @ (TurnEvent::ToolCall { .. } | TurnEvent::ToolResult { .. }) => {
++                                        let Some(frame) = tool_ws_frame(tool_event) else { continue };
++                                        frame
+                                     }
+-                                    TurnEvent::ToolResult {
+-                                        id, name, output, ..
+-                                    } => {
+-                                        serde_json::json!({ "type": "tool_result", "id": id, "name": name, "output": output })
++                                    TurnEvent::Subagent { parent_call_id, step } => {
++                                        let Some(frame) = subagent_ws_frame(parent_call_id, step) else { continue };
++                                        frame
+                                     }
+                                     TurnEvent::ApprovalRequest {
+                                         request_id,
+@@ -4360,6 +4399,67 @@ data: {{\"type\":\"message_stop\"}}\n\n"
+         );
+     }
+ 
++    #[test]
++    fn subagent_event_ws_frames_wrap_parent_shaped_tool_frames() {
++        use zeroclaw_api::agent::{SubagentStep, TurnEvent};
++        let start = subagent_ws_frame(
++            "call-1".into(),
++            SubagentStep::Start {
++                run_id: "run-1".into(),
++            },
++        );
++        assert_eq!(
++            start,
++            Some(serde_json::json!({
++                "type": "subagent_event",
++                "parent_call_id": "call-1",
++                "event": { "type": "subagent_start", "run_id": "run-1" },
++            }))
++        );
++        let call = TurnEvent::ToolCall {
++            id: "c-1".into(),
++            name: "shell".into(),
++            args: serde_json::json!({"command": "ls"}),
++        };
++        assert_eq!(
++            subagent_ws_frame("call-1".into(), SubagentStep::Event(Box::new(call.clone()))),
++            Some(serde_json::json!({
++                "type": "subagent_event",
++                "parent_call_id": "call-1",
++                "event": tool_ws_frame(call).unwrap(),
++            }))
++        );
++        let result = TurnEvent::ToolResult {
++            id: "c-1".into(),
++            name: "shell".into(),
++            output: "a\nb".into(),
++            artifact: None,
++        };
++        assert_eq!(
++            subagent_ws_frame("call-1".into(), SubagentStep::Event(Box::new(result))).unwrap()["event"],
++            serde_json::json!({ "type": "tool_result", "id": "c-1", "name": "shell", "output": "a\nb" })
++        );
++        assert_eq!(
++            subagent_ws_frame(
++                "call-1".into(),
++                SubagentStep::End {
++                    success: false,
++                    error: Some("boom".into())
++                }
++            )
++            .unwrap()["event"],
++            serde_json::json!({ "type": "subagent_end", "success": false, "error": "boom" })
++        );
++        // Child events without a WS shape are dropped, not sent half-empty.
++        assert_eq!(
++            subagent_ws_frame(
++                "call-1".into(),
++                SubagentStep::Event(Box::new(TurnEvent::Chunk { delta: "x".into() }))
++            ),
++            None
++        );
++    }
++
+     #[test]
+     fn restore_trim_uses_live_history_trimmed_frame_shape() {
+         let frame = history_trimmed_frame_for(zeroclaw_api::agent::TurnEvent::HistoryTrimmed {
+diff --git a/crates/zeroclaw-runtime/src/agent/mod.rs b/crates/zeroclaw-runtime/src/agent/mod.rs
+index 956fced..2b88592 100644
+--- a/crates/zeroclaw-runtime/src/agent/mod.rs
++++ b/crates/zeroclaw-runtime/src/agent/mod.rs
+@@ -18,6 +18,7 @@ pub mod personality;
+ pub mod personality_templates;
+ pub mod pricing_catalog;
+ pub mod prompt;
++pub mod subagent_events;
+ pub mod system_prompt;
+ pub mod thinking;
+ pub(crate) mod tool_call_format;
+diff --git a/crates/zeroclaw-runtime/src/agent/subagent_events.rs b/crates/zeroclaw-runtime/src/agent/subagent_events.rs
+new file mode 100644
+index 0000000..1b11e5d
+--- /dev/null
++++ b/crates/zeroclaw-runtime/src/agent/subagent_events.rs
+@@ -0,0 +1,59 @@
++//! Live view of a `spawn_subagent` run for the parent's event stream.
++//!
++//! The parent turn's tool dispatch scopes a [`SubagentEventSink`] around a
++//! `spawn_subagent` call when it streams events. The child run executes in
++//! the same task, so its tool dispatch and the spawn tool find the sink and
++//! forward their steps as [`TurnEvent::Subagent`] keyed by the parent's
++//! call id. Without a sink (cron, non-streaming callers) nothing changes.
++
++use std::future::Future;
++use tokio::sync::mpsc::Sender;
++use zeroclaw_api::agent::{SubagentStep, TurnEvent};
++
++tokio::task_local! {
++    static SUBAGENT_EVENT_SINK: SubagentEventSink;
++}
++
++/// Parent event channel plus the `spawn_subagent` call id the steps belong to.
++#[derive(Clone)]
++pub struct SubagentEventSink {
++    parent_call_id: String,
++    tx: Sender<TurnEvent>,
++}
++
++impl SubagentEventSink {
++    pub fn new(parent_call_id: impl Into<String>, tx: Sender<TurnEvent>) -> Self {
++        Self {
++            parent_call_id: parent_call_id.into(),
++            tx,
++        }
++    }
++
++    /// The sink of the enclosing `spawn_subagent` call, if any.
++    pub fn current() -> Option<Self> {
++        SUBAGENT_EVENT_SINK.try_with(Clone::clone).ok()
++    }
++
++    pub async fn emit(&self, step: SubagentStep) {
++        let _ = self
++            .tx
++            .send(TurnEvent::Subagent {
++                parent_call_id: self.parent_call_id.clone(),
++                step,
++            })
++            .await;
++    }
++
++    /// Forward one of the child's own events.
++    pub async fn emit_event(&self, event: TurnEvent) {
++        self.emit(SubagentStep::Event(Box::new(event))).await;
++    }
++}
++
++/// Run `fut` with `sink` visible to [`SubagentEventSink::current`].
++pub async fn with_subagent_sink<F: Future>(sink: Option<SubagentEventSink>, fut: F) -> F::Output {
++    match sink {
++        Some(sink) => SUBAGENT_EVENT_SINK.scope(sink, fut).await,
++        None => fut.await,
++    }
++}
+diff --git a/crates/zeroclaw-runtime/src/agent/tool_execution.rs b/crates/zeroclaw-runtime/src/agent/tool_execution.rs
+index aa587c4..bcb3678 100644
+--- a/crates/zeroclaw-runtime/src/agent/tool_execution.rs
++++ b/crates/zeroclaw-runtime/src/agent/tool_execution.rs
+@@ -15,6 +15,7 @@ use zeroclaw_api::tool::{ToolExecutionCancelled, ToolExecutionContext};
+ 
+ // Items that still live in `loop_` — import via the parent module.
+ use super::loop_::{ParsedToolCall, ToolLoopCancelled, is_tool_loop_cancelled, scrub_credentials};
++use super::subagent_events::{SubagentEventSink, with_subagent_sink};
+ use super::turn::{ModelSwitchCallback, TurnMeta, scope_model_switch_state};
+ 
+ // ── Helpers ──────────────────────────────────────────────────────────────
+@@ -276,20 +277,30 @@ pub(crate) async fn execute_one_tool(
+         .clone()
+         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+ 
++    // Inside a `spawn_subagent` run: mirror this call to the parent stream.
++    let parent_sink = SubagentEventSink::current();
++    let tool_call_event = || TurnEvent::ToolCall {
++        id: event_call_id.clone(),
++        name: call_name.to_string(),
++        args: call_arguments.clone(),
++    };
+     if let Some(tx) = event_tx {
+-        let _ = tx
+-            .send(TurnEvent::ToolCall {
+-                id: event_call_id.clone(),
+-                name: call_name.to_string(),
+-                args: call_arguments.clone(),
+-            })
+-            .await;
++        let _ = tx.send(tool_call_event()).await;
+     }
++    if let Some(sink) = &parent_sink {
++        sink.emit_event(tool_call_event()).await;
++    }
++    // A streamed `spawn_subagent` call hands its child a sink keyed by this id.
++    let child_sink = event_tx
++        .filter(|_| tool.name() == crate::tools::SpawnSubagentTool::NAME)
++        .map(|tx| SubagentEventSink::new(event_call_id.clone(), tx.clone()));
+ 
+     let context = ToolExecutionContext::new(cancellation_token.cloned());
+-    let execute = context
+-        .run(tool.execute_with_context(call_arguments.clone(), &context))
+-        .instrument(tool_span.clone());
++    let execute = with_subagent_sink(
++        child_sink,
++        context.run(tool.execute_with_context(call_arguments.clone(), &context)),
++    )
++    .instrument(tool_span.clone());
+     let tool_result = if let Some(model_switch_callback) = dispatch.model_switch_callback {
+         scope_model_switch_state(Arc::clone(model_switch_callback), execute).await
+     } else {
+@@ -473,20 +484,22 @@ pub(crate) async fn execute_one_tool(
+         }
+     };
+ 
+-    if let Some(tx) = event_tx
+-        && let Ok(out) = &outcome
+-    {
+-        let _ = tx
+-            .send(TurnEvent::ToolResult {
+-                id: event_call_id.clone(),
+-                name: call_name.to_string(),
+-                output: scrub_credentials(&out.output),
+-                artifact: out
+-                    .output_data
+-                    .as_ref()
+-                    .and_then(ToolArtifact::from_delivered_data),
+-            })
+-            .await;
++    if let Ok(out) = &outcome {
++        let tool_result_event = || TurnEvent::ToolResult {
++            id: event_call_id.clone(),
++            name: call_name.to_string(),
++            output: scrub_credentials(&out.output),
++            artifact: out
++                .output_data
++                .as_ref()
++                .and_then(ToolArtifact::from_delivered_data),
++        };
++        if let Some(tx) = event_tx {
++            let _ = tx.send(tool_result_event()).await;
++        }
++        if let Some(sink) = &parent_sink {
++            sink.emit_event(tool_result_event()).await;
++        }
+     }
+ 
+     // After the ToolResult card closes, publish the plan if this was a
+@@ -672,6 +685,7 @@ mod tests {
+     use std::sync::{Arc, Mutex};
+     use std::time::Duration;
+     use tokio_util::sync::CancellationToken;
++    use zeroclaw_api::agent::TurnEvent;
+     use zeroclaw_api::tool::{Tool, ToolExecutionContext};
+ 
+     /// Minimal tool that records invocations. Used to verify that the
+@@ -1083,6 +1097,200 @@ mod tests {
+         }
+     }
+ 
++    /// Inner tool of the fake child run below.
++    struct EchoTool;
++
++    #[async_trait]
++    impl zeroclaw_api::attribution::Attributable for EchoTool {
++        fn role(&self) -> zeroclaw_api::attribution::Role {
++            zeroclaw_api::attribution::Role::System
++        }
++        fn alias(&self) -> &str {
++            "test-echo"
++        }
++    }
++
++    #[async_trait]
++    impl Tool for EchoTool {
++        fn name(&self) -> &str {
++            "echo"
++        }
++        fn description(&self) -> &str {
++            "echo"
++        }
++        fn parameters_schema(&self) -> serde_json::Value {
++            serde_json::json!({"type": "object"})
++        }
++        async fn execute(&self, args: serde_json::Value) -> Result<crate::tools::ToolResult> {
++            Ok(crate::tools::ToolResult {
++                success: true,
++                output: args["text"].as_str().unwrap_or_default().to_string().into(),
++                error: None,
++            })
++        }
++    }
++
++    /// Stand-in for a spawning tool: runs a child "turn" in the same task
++    /// that dispatches `echo` without its own event stream, like
++    /// `spawn_subagent`'s non-interactive child run.
++    struct FakeSpawnTool(&'static str);
++
++    #[async_trait]
++    impl zeroclaw_api::attribution::Attributable for FakeSpawnTool {
++        fn role(&self) -> zeroclaw_api::attribution::Role {
++            zeroclaw_api::attribution::Role::System
++        }
++        fn alias(&self) -> &str {
++            "test-fake-spawn"
++        }
++    }
++
++    #[async_trait]
++    impl Tool for FakeSpawnTool {
++        fn name(&self) -> &str {
++            self.0
++        }
++        fn description(&self) -> &str {
++            "spawns"
++        }
++        fn parameters_schema(&self) -> serde_json::Value {
++            serde_json::json!({"type": "object"})
++        }
++        async fn execute(&self, _args: serde_json::Value) -> Result<crate::tools::ToolResult> {
++            let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
++            let meta = test_turn_meta();
++            let inner = execute_one_tool(
++                "echo",
++                serde_json::json!({"text": "from child"}),
++                Some("child-call-1"),
++                ToolDispatchContext {
++                    tools_registry: &tools,
++                    activated_tools: None,
++                    excluded_tools: &[],
++                    model_switch_callback: None,
++                },
++                &meta,
++                &NoopObserver,
++                None,
++                None,
++                None,
++            )
++            .await?;
++            let has_sink = crate::agent::subagent_events::SubagentEventSink::current().is_some();
++            Ok(crate::tools::ToolResult {
++                success: true,
++                output: format!("{}|sink={has_sink}", inner.output).into(),
++                error: None,
++            })
++        }
++    }
++
++    async fn run_parent_call(tool_name: &'static str) -> (String, Vec<TurnEvent>) {
++        let tools: Vec<Box<dyn Tool>> = vec![Box::new(FakeSpawnTool(tool_name))];
++        let meta = test_turn_meta();
++        let (tx, mut rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
++        let outcome = execute_one_tool(
++            tool_name,
++            serde_json::json!({"prompt": "go"}),
++            Some("parent-call-1"),
++            ToolDispatchContext {
++                tools_registry: &tools,
++                activated_tools: None,
++                excluded_tools: &[],
++                model_switch_callback: None,
++            },
++            &meta,
++            &NoopObserver,
++            None,
++            None,
++            Some(&tx),
++        )
++        .await
++        .expect("outcome");
++        drop(tx);
++        let mut events = Vec::new();
++        while let Some(event) = rx.recv().await {
++            events.push(event);
++        }
++        (outcome.output, events)
++    }
++
++    #[tokio::test]
++    async fn subagent_event_child_steps_reach_parent_stream_keyed_by_call_id() {
++        use zeroclaw_api::agent::SubagentStep;
++        let (output, events) = run_parent_call(crate::tools::SpawnSubagentTool::NAME).await;
++        assert_eq!(
++            output, "from child|sink=true",
++            "result to the parent unchanged"
++        );
++        assert_eq!(events.len(), 4, "{events:?}");
++        assert!(matches!(&events[0], TurnEvent::ToolCall { id, .. } if id == "parent-call-1"));
++        match &events[1] {
++            TurnEvent::Subagent {
++                parent_call_id,
++                step: SubagentStep::Event(inner),
++            } => {
++                assert_eq!(parent_call_id, "parent-call-1");
++                assert!(
++                    matches!(inner.as_ref(), TurnEvent::ToolCall { id, name, args }
++                    if id == "child-call-1" && name == "echo" && args["text"] == "from child")
++                );
++            }
++            other => panic!("expected child tool_call, got {other:?}"),
++        }
++        match &events[2] {
++            TurnEvent::Subagent {
++                parent_call_id,
++                step: SubagentStep::Event(inner),
++            } => {
++                assert_eq!(parent_call_id, "parent-call-1");
++                assert!(
++                    matches!(inner.as_ref(), TurnEvent::ToolResult { id, output, .. }
++                    if id == "child-call-1" && output == "from child")
++                );
++            }
++            other => panic!("expected child tool_result, got {other:?}"),
++        }
++        assert!(matches!(&events[3], TurnEvent::ToolResult { id, .. } if id == "parent-call-1"));
++    }
++
++    #[tokio::test]
++    async fn subagent_event_none_for_other_tools_or_without_stream() {
++        let (output, events) = run_parent_call("not_a_spawn").await;
++        assert_eq!(output, "from child|sink=false");
++        assert_eq!(events.len(), 2, "only the parent's own pair: {events:?}");
++        assert!(
++            !events
++                .iter()
++                .any(|e| matches!(e, TurnEvent::Subagent { .. }))
++        );
++
++        // No parent stream: the spawn runs without a sink, nothing to forward.
++        let tools: Vec<Box<dyn Tool>> = vec![Box::new(FakeSpawnTool(
++            crate::tools::SpawnSubagentTool::NAME,
++        ))];
++        let meta = test_turn_meta();
++        let outcome = execute_one_tool(
++            crate::tools::SpawnSubagentTool::NAME,
++            serde_json::json!({}),
++            Some("parent-call-1"),
++            ToolDispatchContext {
++                tools_registry: &tools,
++                activated_tools: None,
++                excluded_tools: &[],
++                model_switch_callback: None,
++            },
++            &meta,
++            &NoopObserver,
++            None,
++            None,
++            None,
++        )
++        .await
++        .expect("outcome");
++        assert_eq!(outcome.output, "from child|sink=false");
++    }
++
+     fn test_turn_meta() -> crate::agent::turn::TurnMeta<'static> {
+         crate::agent::turn::TurnMeta {
+             parent_agent_alias: None,
+diff --git a/crates/zeroclaw-runtime/src/tools/spawn_subagent.rs b/crates/zeroclaw-runtime/src/tools/spawn_subagent.rs
+index bd98698..49f5e30 100644
+--- a/crates/zeroclaw-runtime/src/tools/spawn_subagent.rs
++++ b/crates/zeroclaw-runtime/src/tools/spawn_subagent.rs
+@@ -12,6 +12,7 @@ use anyhow::Result;
+ use async_trait::async_trait;
+ use serde_json::json;
+ use std::sync::Arc;
++use zeroclaw_api::agent::SubagentStep;
+ use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
+ use zeroclaw_config::schema::Config;
+ use zeroclaw_log::scope;
+@@ -275,6 +276,15 @@ impl Tool for SpawnSubagentTool {
+                 .await;
+         }
+ 
++        // Parent turn streams events: show this run live on its stream.
++        let parent_sink = crate::agent::subagent_events::SubagentEventSink::current();
++        if let Some(sink) = &parent_sink {
++            sink.emit(SubagentStep::Start {
++                run_id: run_id.clone(),
++            })
++            .await;
++        }
++
+         let run_result = Box::pin(scope!(
+             agent_alias: parent_alias,
+             session_key: run_id,
+@@ -316,6 +326,16 @@ impl Tool for SpawnSubagentTool {
+                 .await;
+         }
+ 
++        if let Some(sink) = &parent_sink {
++            sink.emit(SubagentStep::End {
++                success: run_result.is_ok(),
++                error: run_result.as_ref().err().map(|e| {
++                    crate::agent::loop_::scrub_credentials(&format!("subagent run failed: {e}"))
++                }),
++            })
++            .await;
++        }
++
+         match run_result {
+             Ok(response) => Ok(ToolResult {
+                 success: true,
+@@ -474,6 +494,46 @@ mod tests {
+         );
+     }
+ 
++    #[tokio::test]
++    async fn subagent_event_start_and_end_bracket_the_run_on_a_parent_sink() {
++        use crate::agent::subagent_events::{SubagentEventSink, with_subagent_sink};
++        use zeroclaw_api::agent::TurnEvent;
++        let tool = SpawnSubagentTool::new(
++            Arc::new(config_with_agent("alpha")),
++            "alpha",
++            Arc::new(SecurityPolicy::default()),
++        );
++        let (tx, mut rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
++        let sink = SubagentEventSink::new("call-7", tx);
++        let result = with_subagent_sink(Some(sink), tool.execute(json!({ "prompt": "hello" })))
++            .await
++            .expect("execute returns Ok");
++        let mut steps = Vec::new();
++        while let Ok(event) = rx.try_recv() {
++            match event {
++                TurnEvent::Subagent {
++                    parent_call_id,
++                    step,
++                } => {
++                    assert_eq!(parent_call_id, "call-7");
++                    steps.push(step);
++                }
++                other => panic!("only subagent events expected, got {other:?}"),
++            }
++        }
++        assert!(
++            matches!(steps.first(), Some(SubagentStep::Start { run_id }) if !run_id.is_empty()),
++            "{steps:?}"
++        );
++        match steps.last() {
++            Some(SubagentStep::End { success, error }) => {
++                assert_eq!(*success, result.success);
++                assert_eq!(error.is_some(), !result.success);
++            }
++            other => panic!("expected End last, got {other:?}"),
++        }
++    }
++
+     // ── risk-profile tool gates spawn_subagent ──
+ 
+     fn config_with_allowed_tools(alias: &str, allowed_tools: Vec<String>) -> Config {
+-- 
+2.56.1
+

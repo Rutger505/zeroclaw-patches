@@ -1,0 +1,80 @@
+From f2035f587ba33200266fc5e05b72ce7a5ba782fa Mon Sep 17 00:00:00 2001
+From: Rocky <rocky@zeroclaw>
+Date: Mon, 16 Nov 2026 05:53:59 +0000
+Subject: [PATCH 7/7] fix(cli): exit quietly on a closed stdout pipe instead of
+ aborting
+
+Rust ignores SIGPIPE, so a one-shot command whose stdout pipe closes
+early (`zeroclaw config list | head`) panics in println!, and with
+panic = "abort" that is a SIGABRT plus a coredump. Restore the default
+SIGPIPE for print-and-exit commands so they die quietly like other CLI
+tools. Long-running commands keep SIGPIPE ignored.
+---
+ src/main.rs | 44 ++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 44 insertions(+)
+
+diff --git a/src/main.rs b/src/main.rs
+index 9e5451f..3ec4eb8 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -8987,6 +8987,45 @@ fn install_daemon_sigbus_reset() -> Result<()> {
+     Ok(())
+ }
+ 
++/// One-shot commands that print and exit. Rust ignores SIGPIPE, so printing to
++/// a closed pipe (`zeroclaw config list | head`) makes `println!` panic, and
++/// with `panic = "abort"` that is a SIGABRT + coredump. These commands get the
++/// default SIGPIPE back and exit quietly instead, like other CLI tools.
++/// Long-running commands (daemon, gateway, agent, channels, ...) keep SIGPIPE
++/// ignored: a closed socket or child pipe must stay an `EPIPE` error there.
++fn restores_default_sigpipe(command: &Commands) -> bool {
++    matches!(
++        command,
++        Commands::Status { .. }
++            | Commands::Doctor { .. }
++            | Commands::Config { .. }
++            | Commands::Cron { .. }
++            | Commands::Models { .. }
++            | Commands::Providers { .. }
++            | Commands::Agents { .. }
++            | Commands::Channels { .. }
++            | Commands::Integrations { .. }
++            | Commands::Skills { .. }
++            | Commands::Sop { .. }
++            | Commands::Memory { .. }
++            | Commands::Update { .. }
++            | Commands::Estop { .. }
++            | Commands::Props { .. }
++            | Commands::Completions { .. }
++            | Commands::MarkdownHelp
++            | Commands::MarkdownSchema
++    )
++}
++
++#[cfg(unix)]
++fn restore_default_sigpipe() {
++    // SAFETY: sigaction-backed and process-wide; only swaps SIG_IGN for SIG_DFL,
++    // no handler code runs.
++    unsafe {
++        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
++    }
++}
++
+ fn main() -> Result<()> {
+     let command = Cli::command();
+ 
+@@ -9553,6 +9592,11 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
+         install_daemon_sigbus_reset()?;
+     }
+ 
++    #[cfg(unix)]
++    if restores_default_sigpipe(&cli.command) {
++        restore_default_sigpipe();
++    }
++
+     #[cfg(feature = "agent-runtime")]
+     crate::i18n::init(&crate::i18n::detect_locale());
+ 
+-- 
+2.56.1
+

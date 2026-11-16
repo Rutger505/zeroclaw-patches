@@ -5,3 +5,4 @@
 0004-gateway-ws-attach.patch
 0005-tools-sessions-list-name-query.patch
 0006-gateway-ws-subagent-events.patch
+0007-cli-sigpipe-exit-quietly.patch

@@ -18,6 +18,7 @@ The `zeroclaw` role in [homelab-infrastructure](https://github.com/Rutger505-Org
 - `0004-gateway-ws-attach.patch`: a second socket on a session follows its running turn: `{type:"attach"}` → `{type:"attached", running, turn_id, replayed}`, the turn's frames so far (streamed deltas merged), then live up to `done`/`aborted`/`error`. Read-only (`ATTACHED_READ_ONLY`). Used by someclaw to show steps after its own restart mid-turn.
 - `0005-tools-sessions-list-name-query.patch`: `sessions_list` shows each session's `name` (thread title) and takes an optional `query`: full-text search via `sessions_fts`, only matching sessions (newest first). Search no longer breaks on a word with a `"`.
 - `0006-gateway-ws-subagent-events.patch`: a `spawn_subagent` call on `/ws/chat` streams the subagent's steps live: `{type:"subagent_event", parent_call_id, event}`, `parent_call_id` = the spawn's `tool_call` `id`, `event` = `{type:"subagent_start", run_id}`, the child's `tool_call`/`tool_result` (same shape as the parent's), `{type:"subagent_end", success, error}`. Tool steps only, no subagent text. No stream (cron, other channels): unchanged.
+- `0007-cli-sigpipe-exit-quietly.patch`: one-shot CLI commands (`config`, `status`, `update`, `cron`, `models`, ...) restore the default SIGPIPE, so `zeroclaw config list | head` exits quietly instead of panicking in `println!` (`panic = "abort"` → SIGABRT + coredump). Long-running commands (daemon, gateway, agent, ...) keep SIGPIPE ignored. Drop it once upstream handles this.
 
 ## Workflow
 

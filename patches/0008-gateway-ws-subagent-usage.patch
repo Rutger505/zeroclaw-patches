@@ -1,0 +1,615 @@
+From 0ac65ee5fecc32b8fd9f5ee4666231cc1bfa8b38 Mon Sep 17 00:00:00 2001
+From: Rocky <rocky@zeroclaw>
+Date: Sat, 21 Nov 2026 21:15:07 +0000
+Subject: [PATCH 8/8] feat(gateway): count spawn_subagent usage in the parent
+ turn
+
+A spawn_subagent child run has no event stream of its own, so its
+TurnEvent::Usage (accepted responses, rejected billable attempts,
+max-iteration summary attempts) was dropped and the parent's /ws/chat
+done frame undercounted tokens and cost. All Usage emission sites now go
+through UsageSink: the turn's own stream when it has one (unchanged),
+otherwise the enclosing SubagentEventSink as TurnEvent::Subagent with
+SubagentStep::Event(Usage). Never both.
+
+/ws/chat folds a subagent Usage into input_tokens/output_tokens/
+tokens_used and usage_by_provider (so cost_usd includes it), but not
+into the accepted-serving snapshot: the context meter, last_* fields and
+provider/model identity stay the parent turn's. The done frame gains
+subagent_input_tokens/subagent_output_tokens (subset of the totals, null
+without subagent usage). No ws frame is sent for the usage step itself.
+ACP and RPC ignore Subagent events, so their counts are unchanged.
+---
+ crates/zeroclaw-api/src/agent.rs              |   2 +-
+ crates/zeroclaw-gateway/src/ws.rs             | 146 +++++++++++++++++-
+ .../src/agent/subagent_events.rs              |  96 ++++++++++++
+ .../src/agent/turn/max_iter.rs                |  74 +++++++--
+ crates/zeroclaw-runtime/src/agent/turn/mod.rs |  33 ++--
+ .../src/agent/turn/parse_response.rs          |  94 ++++++++---
+ 6 files changed, 392 insertions(+), 53 deletions(-)
+
+diff --git a/crates/zeroclaw-api/src/agent.rs b/crates/zeroclaw-api/src/agent.rs
+index 62e904a..2681b5f 100644
+--- a/crates/zeroclaw-api/src/agent.rs
++++ b/crates/zeroclaw-api/src/agent.rs
+@@ -96,7 +96,7 @@ pub enum BudgetWarningPeriod {
+ pub enum SubagentStep {
+     /// The subagent run starts.
+     Start { run_id: String },
+-    /// One of the subagent's own events (`ToolCall` / `ToolResult`).
++    /// One of the subagent's own events (`ToolCall` / `ToolResult` / `Usage`).
+     Event(Box<TurnEvent>),
+     /// The subagent run finished; `error` is set when it failed.
+     End {
+diff --git a/crates/zeroclaw-gateway/src/ws.rs b/crates/zeroclaw-gateway/src/ws.rs
+index 33398ce..a6cd927 100644
+--- a/crates/zeroclaw-gateway/src/ws.rs
++++ b/crates/zeroclaw-gateway/src/ws.rs
+@@ -1796,10 +1796,31 @@ struct UsageFold {
+     last_context_token_budget: Option<u64>,
+     last_model_context_window: Option<u64>,
+     usage_by_provider: std::collections::HashMap<(String, String), ProviderUsageEntry>,
++    /// `spawn_subagent` children's share of the totals above.
++    subagent_input_tokens: Option<u64>,
++    subagent_output_tokens: Option<u64>,
+ }
+ 
+ impl UsageFold {
+     fn apply(&mut self, event: zeroclaw_api::agent::TurnEvent) {
++        self.fold(event, false);
++    }
++
++    /// Usage of a `spawn_subagent` child run: billed into the totals and the
++    /// per-(provider, model) breakdown, tracked in the `subagent_*` fields,
++    /// but never the accepted-serving snapshot (context meter and terminal
++    /// identity stay the parent turn's).
++    fn apply_subagent(&mut self, event: zeroclaw_api::agent::TurnEvent) {
++        self.fold(event, true);
++    }
++
++    /// The `subagent_*` share of the totals on a terminal frame.
++    fn insert_subagent_totals(&self, frame: &mut serde_json::Value) {
++        frame["subagent_input_tokens"] = serde_json::json!(self.subagent_input_tokens);
++        frame["subagent_output_tokens"] = serde_json::json!(self.subagent_output_tokens);
++    }
++
++    fn fold(&mut self, event: zeroclaw_api::agent::TurnEvent, subagent: bool) {
+         let zeroclaw_api::agent::TurnEvent::Usage {
+             input_tokens,
+             cached_input_tokens,
+@@ -1831,7 +1852,14 @@ impl UsageFold {
+         if let Some(ot) = output_tokens {
+             self.total_output_tokens = Some(self.total_output_tokens.unwrap_or(0) + ot);
+         }
+-        if accepted {
++        if subagent {
++            if let Some(it) = input_tokens {
++                self.subagent_input_tokens = Some(self.subagent_input_tokens.unwrap_or(0) + it);
++            }
++            if let Some(ot) = output_tokens {
++                self.subagent_output_tokens = Some(self.subagent_output_tokens.unwrap_or(0) + ot);
++            }
++        } else if accepted {
+             self.last_provider_ref = Some(provider_ref.clone());
+             self.last_model = Some(served_model.clone());
+             self.last_context_token_budget = context_token_budget;
+@@ -2326,6 +2354,16 @@ async fn process_chat_message(
+                                         frame
+                                     }
+                                     TurnEvent::Subagent { parent_call_id, step } => {
++                                        // A child's usage counts toward this turn; no frame of its own.
++                                        let step = match step {
++                                            zeroclaw_api::agent::SubagentStep::Event(event)
++                                                if matches!(*event, TurnEvent::Usage { .. }) =>
++                                            {
++                                                usage_fold.apply_subagent(*event);
++                                                continue;
++                                            }
++                                            step => step,
++                                        };
+                                         let Some(frame) = subagent_ws_frame(parent_call_id, step) else { continue };
+                                         frame
+                                     }
+@@ -2629,7 +2667,8 @@ async fn process_chat_message(
+             // transcript. Privacy: only the model names cross the wire — the
+             // classifier `category` (and any refusal explanation) never do.
+             let safeguard_notice = outcome.safeguard_fallback.as_ref();
+-            let done = build_done_frame_json(&meta, &usage_by_provider_vec);
++            let mut done = build_done_frame_json(&meta, &usage_by_provider_vec);
++            usage_fold.insert_subagent_totals(&mut done);
+             for frame in success_terminal_ws_frames(safeguard_notice, done) {
+                 turn_watch.record(&frame);
+                 let _ = sender.send(Message::Text(frame.to_string().into())).await;
+@@ -2663,6 +2702,8 @@ async fn process_chat_message(
+                         "input_tokens": usage_fold.total_input_tokens,
+                         "output_tokens": usage_fold.total_output_tokens,
+                         "tokens_used": total_tokens,
++                        "subagent_input_tokens": usage_fold.subagent_input_tokens,
++                        "subagent_output_tokens": usage_fold.subagent_output_tokens,
+                         "cost_usd": cost_usd,
+                         "last_input_tokens": usage_fold.last_input_tokens,
+                         "trace_id": turn_id,
+@@ -5837,6 +5878,107 @@ data: {{\"type\":\"message_stop\"}}\n\n"
+         }
+     }
+ 
++    /// `spawn_subagent` usage (accepted and rejected) bills into the totals
++    /// and the breakdown, shows up in the `subagent_*` fields, and leaves the
++    /// parent's accepted-serving snapshot alone.
++    #[test]
++    fn subagent_usage_folds_into_totals_but_not_the_serving_snapshot() {
++        let mut fold = UsageFold::default();
++        let mut parent = usage_event(
++            "anthropic.default",
++            "opus",
++            Some(1000),
++            None,
++            Some(50),
++            Some(0.1),
++            true,
++        );
++        if let zeroclaw_api::agent::TurnEvent::Usage {
++            ref mut context_token_budget,
++            ref mut model_context_window,
++            ..
++        } = parent
++        {
++            *context_token_budget = Some(150_000);
++            *model_context_window = Some(200_000);
++        }
++        fold.apply(parent);
++        fold.apply_subagent(usage_event(
++            "openai.default",
++            "mini",
++            Some(300),
++            None,
++            Some(20),
++            Some(0.02),
++            false,
++        ));
++        fold.apply_subagent(usage_event(
++            "openai.default",
++            "mini",
++            Some(400),
++            Some(100),
++            Some(30),
++            Some(0.03),
++            true,
++        ));
++
++        assert_eq!(fold.total_input_tokens, Some(1700));
++        assert_eq!(fold.total_output_tokens, Some(100));
++        assert_eq!(fold.subagent_input_tokens, Some(700));
++        assert_eq!(fold.subagent_output_tokens, Some(50));
++        assert_eq!(fold.last_provider_ref.as_deref(), Some("anthropic.default"));
++        assert_eq!(fold.last_model.as_deref(), Some("opus"));
++        assert_eq!(fold.last_input_tokens, Some(1000));
++        assert_eq!(fold.last_context_token_budget, Some(150_000));
++        assert_eq!(fold.last_model_context_window, Some(200_000));
++
++        let mut frame = serde_json::json!({ "type": "done" });
++        fold.insert_subagent_totals(&mut frame);
++        assert_eq!(frame["subagent_input_tokens"], 700);
++        assert_eq!(frame["subagent_output_tokens"], 50);
++
++        let entries = fold.take_sorted_entries();
++        assert_eq!(entries.len(), 2);
++        assert_eq!(entries[1].provider_ref, "openai.default");
++        assert_eq!(entries[1].input_tokens, 700);
++        assert_eq!(entries[1].output_tokens, 50);
++        assert_eq!(entries[1].cached_input_tokens, 100);
++        assert!((UsageFold::total_cost_usd(&entries).unwrap() - 0.15).abs() < 1e-9);
++    }
++
++    #[test]
++    fn subagent_usage_fields_null_without_a_subagent() {
++        let mut fold = UsageFold::default();
++        fold.apply(usage_event(
++            "anthropic.default",
++            "opus",
++            Some(10),
++            None,
++            Some(5),
++            None,
++            true,
++        ));
++        assert_eq!(fold.total_input_tokens, Some(10));
++        let mut frame = serde_json::json!({ "type": "done" });
++        fold.insert_subagent_totals(&mut frame);
++        assert!(frame["subagent_input_tokens"].is_null());
++        assert!(frame["subagent_output_tokens"].is_null());
++    }
++
++    #[test]
++    fn subagent_usage_step_renders_no_ws_frame() {
++        let step = zeroclaw_api::agent::SubagentStep::Event(Box::new(usage_event(
++            "openai.default",
++            "mini",
++            Some(1),
++            None,
++            Some(1),
++            None,
++            true,
++        )));
++        assert!(subagent_ws_frame("call-1".into(), step).is_none());
++    }
++
+     /// Blocking regression (note9 blocker 1): an accepted Usage event followed
+     /// by a rejected billed Usage event must keep the accepted-serving
+     /// snapshot while billing both attempts. Drives `UsageFold::apply` — the
+diff --git a/crates/zeroclaw-runtime/src/agent/subagent_events.rs b/crates/zeroclaw-runtime/src/agent/subagent_events.rs
+index 1b11e5d..f625a77 100644
+--- a/crates/zeroclaw-runtime/src/agent/subagent_events.rs
++++ b/crates/zeroclaw-runtime/src/agent/subagent_events.rs
+@@ -50,6 +50,33 @@ impl SubagentEventSink {
+     }
+ }
+ 
++/// Where a `TurnEvent::Usage` goes: the turn's own stream, or, in a
++/// `spawn_subagent` child run (which has no stream), the parent's stream as
++/// `SubagentStep::Event` so the parent turn's usage counts the child's calls.
++pub(crate) enum UsageSink<'a> {
++    Stream(&'a Sender<TurnEvent>),
++    Subagent(SubagentEventSink),
++}
++
++impl<'a> UsageSink<'a> {
++    /// `None` when nobody listens. A turn with its own stream never forwards.
++    pub(crate) fn resolve(event_tx: Option<&'a Sender<TurnEvent>>) -> Option<Self> {
++        match event_tx {
++            Some(tx) => Some(Self::Stream(tx)),
++            None => SubagentEventSink::current().map(Self::Subagent),
++        }
++    }
++
++    pub(crate) async fn send(&self, usage: TurnEvent) {
++        match self {
++            Self::Stream(tx) => {
++                let _ = tx.send(usage).await;
++            }
++            Self::Subagent(sink) => sink.emit_event(usage).await,
++        }
++    }
++}
++
+ /// Run `fut` with `sink` visible to [`SubagentEventSink::current`].
+ pub async fn with_subagent_sink<F: Future>(sink: Option<SubagentEventSink>, fut: F) -> F::Output {
+     match sink {
+@@ -57,3 +84,72 @@ pub async fn with_subagent_sink<F: Future>(sink: Option<SubagentEventSink>, fut:
+         None => fut.await,
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn usage(accepted: bool) -> TurnEvent {
++        TurnEvent::Usage {
++            input_tokens: Some(10),
++            cached_input_tokens: None,
++            output_tokens: Some(2),
++            cost_usd: None,
++            context_token_budget: None,
++            model_context_window: None,
++            provider_ref: "test.default".into(),
++            model: "m".into(),
++            accepted,
++            estimated_input_tokens: None,
++        }
++    }
++
++    #[tokio::test]
++    async fn subagent_usage_without_stream_goes_to_parent_sink() {
++        let (parent_tx, mut parent_rx) = tokio::sync::mpsc::channel(4);
++        let sink = SubagentEventSink::new("spawn-1", parent_tx);
++        with_subagent_sink(Some(sink), async {
++            let target = UsageSink::resolve(None).expect("parent sink in scope");
++            target.send(usage(false)).await;
++        })
++        .await;
++        match parent_rx.try_recv().expect("forwarded") {
++            TurnEvent::Subagent {
++                parent_call_id,
++                step: SubagentStep::Event(inner),
++            } => {
++                assert_eq!(parent_call_id, "spawn-1");
++                assert!(matches!(
++                    *inner,
++                    TurnEvent::Usage {
++                        accepted: false,
++                        ..
++                    }
++                ));
++            }
++            other => panic!("expected subagent usage, got {other:?}"),
++        }
++    }
++
++    #[tokio::test]
++    async fn subagent_usage_own_stream_wins_and_is_not_double_sent() {
++        let (parent_tx, mut parent_rx) = tokio::sync::mpsc::channel(4);
++        let (own_tx, mut own_rx) = tokio::sync::mpsc::channel(4);
++        let sink = SubagentEventSink::new("spawn-1", parent_tx);
++        with_subagent_sink(Some(sink), async {
++            let target = UsageSink::resolve(Some(&own_tx)).expect("own stream");
++            target.send(usage(true)).await;
++        })
++        .await;
++        assert!(matches!(
++            own_rx.try_recv(),
++            Ok(TurnEvent::Usage { accepted: true, .. })
++        ));
++        assert!(parent_rx.try_recv().is_err(), "no copy to the parent sink");
++    }
++
++    #[tokio::test]
++    async fn subagent_usage_dropped_without_stream_or_sink() {
++        assert!(UsageSink::resolve(None).is_none());
++    }
++}
+diff --git a/crates/zeroclaw-runtime/src/agent/turn/max_iter.rs b/crates/zeroclaw-runtime/src/agent/turn/max_iter.rs
+index c0cf599..4592a45 100644
+--- a/crates/zeroclaw-runtime/src/agent/turn/max_iter.rs
++++ b/crates/zeroclaw-runtime/src/agent/turn/max_iter.rs
+@@ -47,22 +47,21 @@ async fn emit_summary_attempt_usage(
+     event_tx: Option<&Sender<TurnEvent>>,
+     summaries: &[SettledAttemptSummary],
+ ) {
+-    if let Some(tx) = event_tx {
++    if let Some(sink) = crate::agent::subagent_events::UsageSink::resolve(event_tx) {
+         for summary in summaries {
+-            let _ = tx
+-                .send(TurnEvent::Usage {
+-                    input_tokens: summary.input_tokens,
+-                    cached_input_tokens: summary.cached_input_tokens,
+-                    output_tokens: summary.output_tokens,
+-                    cost_usd: summary.cost_usd,
+-                    context_token_budget: None,
+-                    model_context_window: None,
+-                    provider_ref: summary.provider_ref.clone(),
+-                    model: summary.model.clone(),
+-                    accepted: summary.accepted,
+-                    estimated_input_tokens: summary.estimated_input_tokens,
+-                })
+-                .await;
++            sink.send(TurnEvent::Usage {
++                input_tokens: summary.input_tokens,
++                cached_input_tokens: summary.cached_input_tokens,
++                output_tokens: summary.output_tokens,
++                cost_usd: summary.cost_usd,
++                context_token_budget: None,
++                model_context_window: None,
++                provider_ref: summary.provider_ref.clone(),
++                model: summary.model.clone(),
++                accepted: summary.accepted,
++                estimated_input_tokens: summary.estimated_input_tokens,
++            })
++            .await;
+         }
+     }
+ }
+@@ -2217,6 +2216,51 @@ mod tests {
+     use super::*;
+     use zeroclaw_api::turn_stop::turn_stop;
+ 
++    /// Summary attempts of a `spawn_subagent` child (no stream of its own),
++    /// rejected ones included, reach the parent sink.
++    #[tokio::test]
++    async fn subagent_usage_summary_attempts_reach_parent_sink() {
++        use crate::agent::subagent_events::{SubagentEventSink, with_subagent_sink};
++        use zeroclaw_api::agent::SubagentStep;
++        let summary = |accepted, input| SettledAttemptSummary {
++            provider_ref: "test.default".into(),
++            model: "m".into(),
++            input_tokens: Some(input),
++            cached_input_tokens: None,
++            output_tokens: Some(1),
++            cost_usd: Some(0.01),
++            accepted,
++            estimated_input_tokens: None,
++        };
++        let (parent_tx, mut parent_rx) = tokio::sync::mpsc::channel(8);
++        with_subagent_sink(
++            Some(SubagentEventSink::new("spawn-1", parent_tx)),
++            emit_summary_attempt_usage(None, &[summary(false, 5), summary(true, 9)]),
++        )
++        .await;
++        let mut seen = Vec::new();
++        while let Ok(event) = parent_rx.try_recv() {
++            match event {
++                TurnEvent::Subagent {
++                    parent_call_id,
++                    step: SubagentStep::Event(inner),
++                } => match *inner {
++                    TurnEvent::Usage {
++                        input_tokens,
++                        accepted,
++                        ..
++                    } => {
++                        assert_eq!(parent_call_id, "spawn-1");
++                        seen.push((input_tokens, accepted));
++                    }
++                    other => panic!("expected usage, got {other:?}"),
++                },
++                other => panic!("expected subagent event, got {other:?}"),
++            }
++        }
++        assert_eq!(seen, vec![(Some(5), false), (Some(9), true)]);
++    }
++
+     #[test]
+     fn the_iteration_cap_stop_is_typed_and_says_what_it_always_said() {
+         let stop = CompletionLimit::LocalIterations(10).stop();
+diff --git a/crates/zeroclaw-runtime/src/agent/turn/mod.rs b/crates/zeroclaw-runtime/src/agent/turn/mod.rs
+index 1c9fb62..488f2e7 100644
+--- a/crates/zeroclaw-runtime/src/agent/turn/mod.rs
++++ b/crates/zeroclaw-runtime/src/agent/turn/mod.rs
+@@ -1561,29 +1561,28 @@ async fn emit_rejected_attempt_usage(
+     event_tx: Option<&tokio::sync::mpsc::Sender<TurnEvent>>,
+     attempts: &[zeroclaw_providers::dispatch::AccountedAttempt],
+ ) {
+-    if let Some(tx) = event_tx {
++    if let Some(sink) = crate::agent::subagent_events::UsageSink::resolve(event_tx) {
+         for billable in crate::agent::cost::billable_provider_attempts(attempts) {
+             let cost_usd = crate::agent::cost::compute_cost_usd(
+                 billable.attempt.provider_ref(),
+                 billable.attempt.model(),
+                 billable.usage,
+             );
+-            let _ = tx
+-                .send(TurnEvent::Usage {
+-                    input_tokens: billable.usage.input_tokens,
+-                    cached_input_tokens: billable.usage.cached_input_tokens,
+-                    output_tokens: billable.usage.output_tokens,
+-                    cost_usd,
+-                    context_token_budget: None,
+-                    model_context_window: None,
+-                    provider_ref: billable.attempt.provider_ref().to_string(),
+-                    model: billable.attempt.model().to_string(),
+-                    accepted: false,
+-                    // Rejected billing telemetry never feeds the context
+-                    // meter, so it carries no display estimate.
+-                    estimated_input_tokens: None,
+-                })
+-                .await;
++            sink.send(TurnEvent::Usage {
++                input_tokens: billable.usage.input_tokens,
++                cached_input_tokens: billable.usage.cached_input_tokens,
++                output_tokens: billable.usage.output_tokens,
++                cost_usd,
++                context_token_budget: None,
++                model_context_window: None,
++                provider_ref: billable.attempt.provider_ref().to_string(),
++                model: billable.attempt.model().to_string(),
++                accepted: false,
++                // Rejected billing telemetry never feeds the context
++                // meter, so it carries no display estimate.
++                estimated_input_tokens: None,
++            })
++            .await;
+         }
+     }
+ }
+diff --git a/crates/zeroclaw-runtime/src/agent/turn/parse_response.rs b/crates/zeroclaw-runtime/src/agent/turn/parse_response.rs
+index a2337fc..c7b1018 100644
+--- a/crates/zeroclaw-runtime/src/agent/turn/parse_response.rs
++++ b/crates/zeroclaw-runtime/src/agent/turn/parse_response.rs
+@@ -421,7 +421,7 @@ pub(crate) async fn record_accepted_chat_response(
+     // render 0% on a 200_000-token window despite a known 40% floor). The
+     // result stays labelled as an estimate and the measured total stays
+     // unknown.
+-    if let Some(tx) = ctx.event_tx {
++    if let Some(sink) = crate::agent::subagent_events::UsageSink::resolve(ctx.event_tx) {
+         let cached_input_tokens = usage.and_then(|u| u.cached_input_tokens);
+         let estimated_input_tokens = if input_tokens.is_none() {
+             let history_estimate = crate::agent::history::estimate_history_tokens(history) as u64;
+@@ -430,23 +430,22 @@ pub(crate) async fn record_accepted_chat_response(
+         } else {
+             None
+         };
+-        let _ = tx
+-            .send(TurnEvent::Usage {
+-                input_tokens,
+-                cached_input_tokens,
+-                output_tokens,
+-                cost_usd,
+-                context_token_budget: Some(ctx.context_limits.context_token_budget as u64),
+-                model_context_window: ctx
+-                    .context_limits
+-                    .configured_model_context_window()
+-                    .map(|tokens| tokens as u64),
+-                provider_ref: effective_provider.to_string(),
+-                model: effective_model.to_string(),
+-                accepted: true,
+-                estimated_input_tokens,
+-            })
+-            .await;
++        sink.send(TurnEvent::Usage {
++            input_tokens,
++            cached_input_tokens,
++            output_tokens,
++            cost_usd,
++            context_token_budget: Some(ctx.context_limits.context_token_budget as u64),
++            model_context_window: ctx
++                .context_limits
++                .configured_model_context_window()
++                .map(|tokens| tokens as u64),
++            provider_ref: effective_provider.to_string(),
++            model: effective_model.to_string(),
++            accepted: true,
++            estimated_input_tokens,
++        })
++        .await;
+     }
+     ::zeroclaw_log::record!(
+         INFO,
+@@ -1226,6 +1225,65 @@ mod cost_usd_regression_tests {
+         assert!(rx.try_recv().is_err(), "must emit exactly one Usage event");
+     }
+ 
++    /// A `spawn_subagent` child run has no stream of its own: its accepted
++    /// usage goes to the enclosing parent sink, keyed by the spawn's call id.
++    #[tokio::test]
++    async fn subagent_usage_accepted_response_reaches_parent_sink_without_stream() {
++        use crate::agent::subagent_events::{SubagentEventSink, with_subagent_sink};
++        use zeroclaw_api::agent::SubagentStep;
++        let (tx, _rx) = tokio::sync::mpsc::channel::<TurnEvent>(4);
++        let (parent_tx, mut parent_rx) = tokio::sync::mpsc::channel::<TurnEvent>(4);
++        let pacing = zeroclaw_config::schema::PacingConfig::default();
++        let mut ctx = estimate_test_ctx(&tx, &pacing, "llamacpp", "local-model", "turn-child");
++        ctx.event_tx = None;
++        let usage = TokenUsage {
++            input_tokens: Some(100),
++            output_tokens: Some(7),
++            ..Default::default()
++        };
++        let history = vec![ChatMessage::user("child prompt")];
++        with_subagent_sink(
++            Some(SubagentEventSink::new("spawn-1", parent_tx)),
++            record_accepted_chat_response(
++                &ctx,
++                "llamacpp",
++                "local-model",
++                "child answer",
++                &[],
++                0,
++                Some(&usage),
++                &history,
++                std::time::Instant::now(),
++                0,
++                None,
++            ),
++        )
++        .await;
++
++        match parent_rx
++            .try_recv()
++            .expect("child usage must reach the parent")
++        {
++            TurnEvent::Subagent {
++                parent_call_id,
++                step: SubagentStep::Event(inner),
++            } => {
++                assert_eq!(parent_call_id, "spawn-1");
++                assert!(matches!(
++                    *inner,
++                    TurnEvent::Usage {
++                        input_tokens: Some(100),
++                        output_tokens: Some(7),
++                        accepted: true,
++                        ..
++                    }
++                ));
++            }
++            other => panic!("expected subagent usage, got {other:?}"),
++        }
++        assert!(parent_rx.try_recv().is_err(), "exactly one usage event");
++    }
++
+     /// `cached_input_tokens` is documented as a subset of `input_tokens`.
+     /// When a provider reports the cached subset but omits the total, the
+     /// measured total must stay unknown — and the *display* estimate must be
+-- 
+2.56.1
+

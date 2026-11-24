@@ -1,0 +1,258 @@
+From bd43624c46532b82f9b123eb0b9606d870ad7ac4 Mon Sep 17 00:00:00 2001
+From: Rocky <rocky@zeroclaw>
+Date: Mon, 23 Nov 2026 22:08:39 +0000
+Subject: [PATCH 9/9] feat(skills): append repo_docs files to delivered skill
+ instructions
+
+A SKILL.md can declare `repo_docs:` in its frontmatter: one path or a
+YAML list (block or inline). When the skill's full instructions reach
+the model (read_skill output, instructions inlined in full mode or for
+`always` skills) each file is appended after the body as
+`--- repo docs: <path> ---` plus its content, or a single
+`--- repo docs: <path> (not found) ---` line when unreadable. A leading
+`~` expands to the home directory. Files are read at delivery time, so
+edits in the repo show up without a reload. Compact summaries and other
+frontmatter keys are unchanged.
+---
+ crates/zeroclaw-runtime/src/skills/mod.rs     | 153 +++++++++++++++++-
+ .../zeroclaw-runtime/src/tools/read_skill.rs  |  18 ++-
+ 2 files changed, 164 insertions(+), 7 deletions(-)
+
+diff --git a/crates/zeroclaw-runtime/src/skills/mod.rs b/crates/zeroclaw-runtime/src/skills/mod.rs
+index a7827fe..8039931 100644
+--- a/crates/zeroclaw-runtime/src/skills/mod.rs
++++ b/crates/zeroclaw-runtime/src/skills/mod.rs
+@@ -392,6 +392,10 @@ struct SkillMarkdownMeta {
+     slash_options: Vec<SkillSlashOption>,
+     /// See [`Skill::always`]. Parsed from a top-level `always: true` key.
+     always: bool,
++    /// Files appended to the skill body when it is delivered to the model
++    /// (`read_skill`, inlined instructions). A single path or a list; read at
++    /// delivery time, see [`repo_docs_appendix`].
++    repo_docs: Vec<String>,
+ }
+ 
+ fn default_version() -> String {
+@@ -1451,6 +1455,7 @@ fn parse_skill_markdown(content: &str) -> ParsedSkillMarkdown {
+ fn parse_simple_frontmatter(s: &str) -> SkillMarkdownMeta {
+     let mut meta = SkillMarkdownMeta::default();
+     let mut collecting_tags = false;
++    let mut collecting_repo_docs = false;
+     let mut collecting_multiline: Option<String> = None;
+     let mut multiline_parts: Vec<String> = Vec::new();
+ 
+@@ -1494,6 +1499,16 @@ fn parse_simple_frontmatter(s: &str) -> SkillMarkdownMeta {
+             // Non-list-item line → stop collecting tags
+             collecting_tags = false;
+         }
++        if collecting_repo_docs {
++            if let Some(item) = line.trim().strip_prefix("- ") {
++                let path = item.trim().trim_matches('"').trim_matches('\'');
++                if !path.is_empty() {
++                    meta.repo_docs.push(path.to_string());
++                }
++                continue;
++            }
++            collecting_repo_docs = false;
++        }
+         let Some((key, val)) = line.split_once(':') else {
+             continue;
+         };
+@@ -1511,6 +1526,19 @@ fn parse_simple_frontmatter(s: &str) -> SkillMarkdownMeta {
+             "version" => meta.version = Some(val.to_string()),
+             "author" => meta.author = Some(val.to_string()),
+             "always" => meta.always = val.eq_ignore_ascii_case("true"),
++            "repo_docs" => {
++                if val.is_empty() {
++                    collecting_repo_docs = true;
++                } else if let Some(list) = val.strip_prefix('[').and_then(|v| v.strip_suffix(']')) {
++                    meta.repo_docs = list
++                        .split(',')
++                        .map(|p| p.trim().trim_matches('"').trim_matches('\'').to_string())
++                        .filter(|p| !p.is_empty())
++                        .collect();
++                } else {
++                    meta.repo_docs = vec![val.to_string()];
++                }
++            }
+             "tags" => {
+                 if val.is_empty() {
+                     // YAML block list follows on subsequent lines
+@@ -1538,6 +1566,41 @@ fn parse_simple_frontmatter(s: &str) -> SkillMarkdownMeta {
+     meta
+ }
+ 
++/// Contents of the `repo_docs` files a SKILL.md declares, formatted to append
++/// after its body: `\n\n--- repo docs: <path> ---\n<content>` per file, or a
++/// `(not found)` line when unreadable. Files are read on every call so repo
++/// edits show up live. Empty without `repo_docs`.
++pub fn repo_docs_appendix(skill_markdown: &str) -> String {
++    use std::fmt::Write;
++
++    let mut out = String::new();
++    for path in parse_skill_markdown(skill_markdown).meta.repo_docs {
++        match std::fs::read_to_string(shellexpand::tilde(&path).as_ref()) {
++            Ok(content) => {
++                let _ = write!(out, "\n\n--- repo docs: {path} ---\n{content}");
++            }
++            Err(_) => {
++                let _ = write!(out, "\n\n--- repo docs: {path} (not found) ---");
++            }
++        }
++    }
++    out
++}
++
++/// [`repo_docs_appendix`] for a loaded skill, re-reading its SKILL.md.
++fn skill_repo_docs_appendix(skill: &Skill) -> String {
++    skill
++        .location
++        .as_deref()
++        .filter(|path| {
++            path.extension()
++                .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
++        })
++        .and_then(|path| std::fs::read_to_string(path).ok())
++        .map(|content| repo_docs_appendix(&content))
++        .unwrap_or_default()
++}
++
+ fn split_skill_frontmatter(content: &str) -> Option<(String, String)> {
+     let normalized = content.replace("\r\n", "\n");
+     let rest = normalized.strip_prefix("---\n")?;
+@@ -1718,8 +1781,15 @@ pub(crate) fn skills_to_prompt_with_mode_and_availability(
+         // always-injected skills; other instructions load through `read_skill`.
+         if (is_full || skill.always) && !skill.prompts.is_empty() {
+             let _ = writeln!(prompt, "    <instructions>");
+-            for instruction in &skill.prompts {
+-                write_xml_text_element(&mut prompt, 6, "instruction", instruction);
++            let repo_docs = skill_repo_docs_appendix(skill);
++            let last = skill.prompts.len() - 1;
++            for (i, instruction) in skill.prompts.iter().enumerate() {
++                if i == last && !repo_docs.is_empty() {
++                    let with_docs = format!("{instruction}{repo_docs}");
++                    write_xml_text_element(&mut prompt, 6, "instruction", &with_docs);
++                } else {
++                    write_xml_text_element(&mut prompt, 6, "instruction", instruction);
++                }
+             }
+             let _ = writeln!(prompt, "    </instructions>");
+         }
+@@ -3446,6 +3516,85 @@ mod registry_tests {
+         assert!(!SlashOptionKind::Integer.supports_length_bounds());
+     }
+ 
++    #[test]
++    fn repo_docs_frontmatter_accepts_string_and_list() {
++        let single = parse_simple_frontmatter("name: x\nrepo_docs: ~/Source/app/AGENTS.md\n");
++        assert_eq!(single.repo_docs, vec!["~/Source/app/AGENTS.md"]);
++
++        let list = parse_simple_frontmatter(
++            "name: x\nrepo_docs:\n  - ~/a/AGENTS.md\n  - \"/b/CLAUDE.md\"\ntags:\n  - t\n",
++        );
++        assert_eq!(list.repo_docs, vec!["~/a/AGENTS.md", "/b/CLAUDE.md"]);
++        assert_eq!(list.tags, vec!["t"]);
++
++        let inline = parse_simple_frontmatter("repo_docs: [/a.md, '/b.md']\n");
++        assert_eq!(inline.repo_docs, vec!["/a.md", "/b.md"]);
++
++        assert!(parse_simple_frontmatter("name: x\n").repo_docs.is_empty());
++    }
++
++    #[test]
++    fn repo_docs_appendix_reads_files_and_notes_missing() {
++        let tmp = tempfile::tempdir().unwrap();
++        let doc = tmp.path().join("AGENTS.md");
++        std::fs::write(&doc, "repo rules v1\n").unwrap();
++        let missing = tmp.path().join("missing.md");
++        let md = format!(
++            "---\nname: x\nrepo_docs:\n  - {}\n  - {}\n---\nbody\n",
++            doc.display(),
++            missing.display()
++        );
++
++        assert_eq!(
++            repo_docs_appendix(&md),
++            format!(
++                "\n\n--- repo docs: {} ---\nrepo rules v1\n\n\n--- repo docs: {} (not found) ---",
++                doc.display(),
++                missing.display()
++            )
++        );
++        // Read on every call: edits show up without reloading the skill.
++        std::fs::write(&doc, "repo rules v2\n").unwrap();
++        assert!(repo_docs_appendix(&md).contains("repo rules v2"));
++        assert!(repo_docs_appendix("---\nname: x\n---\nbody\n").is_empty());
++    }
++
++    #[test]
++    fn repo_docs_inlined_in_full_prompt_only() {
++        let tmp = tempfile::tempdir().unwrap();
++        let doc = tmp.path().join("AGENTS.md");
++        std::fs::write(&doc, "repo rules here").unwrap();
++        let dir = tmp.path().join("app");
++        std::fs::create_dir_all(&dir).unwrap();
++        let skill_md = dir.join("SKILL.md");
++        std::fs::write(
++            &skill_md,
++            format!(
++                "---\nname: app\ndescription: d\nrepo_docs: {}\n---\nskill body\n",
++                doc.display()
++            ),
++        )
++        .unwrap();
++        let skill = load_skill_md(&skill_md, &dir).unwrap();
++        assert_eq!(skill.prompts, vec!["skill body\n".to_string()]);
++
++        let full = skills_to_prompt_with_mode(
++            std::slice::from_ref(&skill),
++            tmp.path(),
++            zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
++        );
++        assert!(full.contains("skill body"), "{full}");
++        assert!(full.contains("--- repo docs: "), "{full}");
++        assert!(full.contains("repo rules here"), "{full}");
++
++        let compact = skills_to_prompt_with_mode(
++            std::slice::from_ref(&skill),
++            tmp.path(),
++            zeroclaw_config::schema::SkillsPromptInjectionMode::Compact,
++        );
++        assert!(!compact.contains("repo rules here"), "{compact}");
++    }
++
+     #[test]
+     fn parse_simple_frontmatter_keeps_blank_line_in_block_scalar() {
+         // A blank line is a paragraph break *inside* a YAML block scalar, not a
+diff --git a/crates/zeroclaw-runtime/src/tools/read_skill.rs b/crates/zeroclaw-runtime/src/tools/read_skill.rs
+index 180e89d..c2f0842 100644
+--- a/crates/zeroclaw-runtime/src/tools/read_skill.rs
++++ b/crates/zeroclaw-runtime/src/tools/read_skill.rs
+@@ -99,11 +99,19 @@ impl Tool for ReadSkillTool {
+         };
+ 
+         match tokio::fs::read_to_string(location).await {
+-            Ok(output) => Ok(ToolResult {
+-                success: true,
+-                output: output.into(),
+-                error: None,
+-            }),
++            Ok(mut output) => {
++                let markdown = location
++                    .extension()
++                    .is_some_and(|ext| ext.eq_ignore_ascii_case("md"));
++                if markdown {
++                    output.push_str(&crate::skills::repo_docs_appendix(&output));
++                }
++                Ok(ToolResult {
++                    success: true,
++                    output: output.into(),
++                    error: None,
++                })
++            }
+             Err(err) => Ok(ToolResult {
+                 success: false,
+                 output: ToolOutput::default(),
+-- 
+2.56.1
+
